@@ -1,0 +1,18 @@
+{
+  "name": "dnm-annual-leave-netlify",
+  "version": "8.0.0-dnm",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@netlify/blobs": "10.7.10",
+    "date-holidays": "3.26.3",
+    "exceljs": "4.4.0"
+  },
+  "scripts": {
+    "check": "node --check public/app.js && node --check netlify/functions/api.mjs",
+    "test": "node scripts/smoke-test.mjs"
+  }
+}
