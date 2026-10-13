@@ -1,6 +1,6 @@
 {
   "name": "dnm-annual-leave-netlify",
-  "version": "8.0.0-dnm",
+  "version": "8.1.0-dnm-hourly",
   "private": true,
   "type": "module",
   "engines": {

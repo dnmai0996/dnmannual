@@ -12,8 +12,8 @@ const SESSION_SECONDS = 10 * 60 * 60;
 const DEFAULT_HASH = 'pbkdf2$100000$7a8e927109f2b5d4c8a18fd3418f9352$fcfbf0d30d90aefca3e450e6bee44a9e50b9e5f364e105d80db5b69b98d3a5ac';
 const ADMIN_HASH_0996 = 'pbkdf2$100000$4d47c197f9d5488c9daaa3960e20b273$4e3110edeabe1590d55a8ef78dea96877c6225d0f1e7c206e207f80a66cf20d5';
 const DEFAULT_WORK = { work_start: '08:30', lunch_start: '12:30', lunch_end: '13:30', work_end: '17:30' };
-const SCHEMA_VERSION = 8;
-const APP_VERSION = '8.0-dnm';
+const SCHEMA_VERSION = 9;
+const APP_VERSION = '8.1-dnm-hourly';
 const SYSTEM_ADMIN_LOGIN = 'admin';
 const REPRESENTATIVE_LOGIN = '대표이사';
 const RESERVED_LOGINS = new Set(['admin', '통합관리자', '관리자', '대표이사', '대표자']);
@@ -63,6 +63,37 @@ function getCookie(request, name) {
   return '';
 }
 function validTime(v) { return /^([01]\d|2[0-3]):[0-5]\d$/.test(String(v || '')); }
+
+function timeToMinutes(value) {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(value || ''));
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}
+function minutesToTime(minutes) {
+  const value = Math.max(0, Math.min(24 * 60, Number(minutes) || 0));
+  return `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`;
+}
+function isThirtyMinuteTime(value) {
+  const minutes = timeToMinutes(value);
+  return minutes != null && minutes % 30 === 0;
+}
+function roundLeaveDays(value) { return Math.round((Number(value || 0) + Number.EPSILON) * 10000) / 10000; }
+function roundHours(value) { return Math.round((Number(value || 0) + Number.EPSILON) * 10) / 10; }
+function workMinutesPerDay(settings = DEFAULT_WORK) {
+  const start = timeToMinutes(settings.work_start), lunchStart = timeToMinutes(settings.lunch_start), lunchEnd = timeToMinutes(settings.lunch_end), end = timeToMinutes(settings.work_end);
+  if ([start, lunchStart, lunchEnd, end].some((v) => v == null) || !(start < lunchStart && lunchStart <= lunchEnd && lunchEnd < end)) return 8 * 60;
+  return Math.max(30, (lunchStart - start) + (end - lunchEnd));
+}
+function parseLocalDateTime(value) {
+  const match = /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d)$/.exec(String(value || ''));
+  if (!match || !parseIso(match[1])) return null;
+  return { raw: `${match[1]}T${match[2]}:${match[3]}`, date: match[1], time: `${match[2]}:${match[3]}`, minutes: Number(match[2]) * 60 + Number(match[3]) };
+}
+function cmpDateTime(a, b) { return String(a || '').localeCompare(String(b || '')); }
+function requestHoursFromDays(s, userId, days) {
+  const u = userById(s, userId);
+  const settings = getWorkSettings(s, u?.company_id);
+  return roundHours(Number(days || 0) * workMinutesPerDay(settings) / 60);
+}
 
 function loginKey(v) { return cleanText(v, 80).normalize('NFKC'); }
 function hasRetireDate(u) { return Boolean(parseIso(cleanText(u?.retire_date, 10))); }
@@ -231,6 +262,10 @@ function ensureStateShape(s) {
     if (!Array.isArray(r.charge_dates)) r.charge_dates = null;
     if (r.start_time == null) r.start_time = '';
     if (r.end_time == null) r.end_time = '';
+    if (r.start_datetime == null) r.start_datetime = r.start_date && r.start_time ? `${r.start_date}T${r.start_time}` : '';
+    if (r.end_datetime == null) r.end_datetime = r.end_date && r.end_time ? `${r.end_date}T${r.end_time}` : '';
+    if (r.hours == null || !Number.isFinite(Number(r.hours))) r.hours = requestHoursFromDays(s, r.user_id, r.days);
+    if (r.leave_type !== 'HOURLY' && !Array.isArray(r.hourly_segments)) r.hourly_segments = null;
     normalizeRequestApproval(s, r, representative?.id || null);
     const current = currentApprovalStep(r);
     const currentUser = current ? userById(s, current.approver_id) : null;
@@ -246,7 +281,7 @@ async function initDb(env) {
   if (!existing) {
     const initial = ensureStateShape(structuredClone(INITIAL_STATE));
     initial.updated_at = nowIso();
-    await env.stateStore.setJSON('state', initial, { onlyIfNew: true, metadata: { schema: 'leave-manager-v7.1' } });
+    await env.stateStore.setJSON('state', initial, { onlyIfNew: true, metadata: { schema: 'leave-manager-v8.1-hourly' } });
   }
 }
 async function loadState(env) {
@@ -288,18 +323,18 @@ function requestDaysInRange(request, a, b) {
   if (request.start_date === request.end_date) return Number(request.days || 0);
   return countBusinessDays(start, end);
 }
-function approvedUsedDays(s, userId, a = null, b = null) { return roundHalf(s.requests.filter((r) => r.user_id === Number(userId) && r.status1 === 'APPROVED' && r.status_final === 'APPROVED').reduce((sum, r) => sum + requestDaysInRange(r, a, b), 0)); }
-function pendingDays(s, userId, exclude = null, a = null, b = null) { return roundHalf(s.requests.filter((r) => r.user_id === Number(userId) && r.id !== Number(exclude) && r.source === 'APPLICATION' && (r.status1 === 'PENDING' || (r.status1 === 'APPROVED' && r.status_final === 'WAITING'))).reduce((sum, r) => sum + requestDaysInRange(r, a, b), 0)); }
+function approvedUsedDays(s, userId, a = null, b = null) { return roundLeaveDays(s.requests.filter((r) => r.user_id === Number(userId) && r.status1 === 'APPROVED' && r.status_final === 'APPROVED').reduce((sum, r) => sum + requestDaysInRange(r, a, b), 0)); }
+function pendingDays(s, userId, exclude = null, a = null, b = null) { return roundLeaveDays(s.requests.filter((r) => r.user_id === Number(userId) && r.id !== Number(exclude) && r.source === 'APPLICATION' && (r.status1 === 'PENDING' || (r.status1 === 'APPROVED' && r.status_final === 'WAITING'))).reduce((sum, r) => sum + requestDaysInRange(r, a, b), 0)); }
 function adjustmentEffectiveDate(a) { return cleanText(a.effective_date || String(a.created_at || '').slice(0, 10), 10); }
-function adjustmentTotal(s, userId, a = null, b = null) { return roundHalf(s.adjustments.filter((x) => x.user_id === Number(userId) && (!a || !b || (adjustmentEffectiveDate(x) >= a && adjustmentEffectiveDate(x) <= b))).reduce((sum, x) => sum + Number(x.amount || 0), 0)); }
+function adjustmentTotal(s, userId, a = null, b = null) { return roundLeaveDays(s.adjustments.filter((x) => x.user_id === Number(userId) && (!a || !b || (adjustmentEffectiveDate(x) >= a && adjustmentEffectiveDate(x) <= b))).reduce((sum, x) => sum + Number(x.amount || 0), 0)); }
 function currentCycleBalance(s, user, asOf = todayIsoKst()) {
   const calcAsOf = isRetiredAsOf(user, asOf) ? user.retire_date : asOf;
   const cycle = serviceCycle(user.join_date, calcAsOf); if (!cycle) return null;
   const used = approvedUsedDays(s, user.id, cycle.cycle_start, cycle.cycle_end);
   const pending = pendingDays(s, user.id, null, cycle.cycle_start, cycle.cycle_end);
   const adjustments = adjustmentTotal(s, user.id, cycle.cycle_start, cycle.cycle_end);
-  const remaining = roundHalf(Number(cycle.granted || 0) + adjustments - used);
-  return { ...cycle, used, pending, adjustments, remaining, projected_remaining: roundHalf(remaining - pending) };
+  const remaining = roundLeaveDays(Number(cycle.granted || 0) + adjustments - used);
+  return { ...cycle, used, pending, adjustments, remaining, projected_remaining: roundLeaveDays(remaining - pending) };
 }
 function roleLabel(u) {
   if (u.is_admin && u.is_representative) return '대표이사/관리자';
@@ -312,6 +347,9 @@ function userSummary(s, u, asOf = todayIsoKst()) {
   if (!u) return null;
   const system = Boolean(u.is_system_account), retired = !system && hasRetireDate(u), calcAsOf = retired && isRetiredAsOf(u, asOf) ? u.retire_date : asOf;
   const cycle = system ? null : currentCycleBalance(s, u, calcAsOf);
+  const settings = system ? DEFAULT_WORK : getWorkSettings(s, u.company_id);
+  const workHoursPerDay = roundHours(workMinutesPerDay(settings) / 60);
+  const toHours = (days) => roundHours(Number(days || 0) * workHoursPerDay);
   const granted = system ? 0 : Number(cycle?.granted || 0), current = system ? 0 : currentEntitlement(u.join_date, calcAsOf), used = system ? 0 : Number(cycle?.used || 0), pending = system ? 0 : Number(cycle?.pending || 0), adjustments = system ? 0 : Number(cycle?.adjustments || 0), remaining = system ? 0 : Number(cycle?.remaining || 0), projected = system ? 0 : Number(cycle?.projected_remaining || 0);
   const totalUsed = system ? 0 : approvedUsedDays(s, u.id);
   const employmentStatus = system ? '시스템' : (!hasRetireDate(u) ? '재직' : (isRetiredAsOf(u, asOf) ? '퇴사' : '퇴사예정'));
@@ -326,11 +364,14 @@ function userSummary(s, u, asOf = todayIsoKst()) {
     cumulative_granted: system ? 0 : cumulativeGranted(u.join_date, calcAsOf), total_used: totalUsed, total_adjustments: system ? 0 : adjustmentTotal(s, u.id),
     service_year: system ? null : cycle?.service_year, cycle_start: system ? '' : cycle?.cycle_start, cycle_end: system ? '' : cycle?.cycle_end,
     next_anniversary: system || retired ? '' : cycle?.next_anniversary, next_entitlement: system || retired ? 0 : cycle?.next_entitlement,
+    work_hours_per_day: workHoursPerDay, granted_hours: toHours(granted), used_hours: toHours(used), pending_hours: toHours(pending), adjustments_hours: toHours(adjustments), remaining_hours: toHours(remaining), projected_remaining_hours: toHours(projected), total_used_hours: toHours(totalUsed),
     granted, used, pending, adjustments, remaining, available: projected, projected_remaining: projected, over_request_allowed: true, as_of: asOf
   };
 }
 function requestRow(s, r) {
   const a = userById(s, r.user_id), f = userById(s, r.approver1_id), z = userById(s, r.final_approver_id);
+  const workHoursPerDay = roundHours(workMinutesPerDay(getWorkSettings(s, a?.company_id)) / 60);
+  const hours = Number.isFinite(Number(r.hours)) ? roundHours(r.hours) : requestHoursFromDays(s, r.user_id, r.days);
   const approvalLine = Array.isArray(r.approval_steps) ? r.approval_steps.map((step) => {
     const u = userById(s, step.approver_id);
     return {
@@ -362,7 +403,8 @@ function requestRow(s, r) {
     company_id: a?.company_id ?? null, company_name: companyName(s, a?.company_id), department: a?.department || '',
     employee_code: a?.employee_code || '', applicant_name: a?.employee_name || '', applicant_login: a?.login_id || '',
     approver1_name: f?.employee_name || '', approver1_login: f?.login_id || '',
-    final_approver_name: z?.employee_name || '', final_approver_login: z?.login_id || ''
+    final_approver_name: z?.employee_name || '', final_approver_login: z?.login_id || '',
+    hours, work_hours_per_day: workHoursPerDay
   };
 }
 function allRequestRows(s) { return s.requests.map((r) => requestRow(s, r)).sort((a, b) => String(b.start_date).localeCompare(String(a.start_date)) || b.id - a.id); }
@@ -383,11 +425,51 @@ function rejectPendingForUnavailableApprover(s, userId, reason) {
     r.updated_at = t; syncLegacyApprovalFields(r);
   }
 }
-function hasLeaveConflict(s, userId, type, start, end) {
-  const c = s.requests.filter((r) => r.user_id === Number(userId) && !['REJECTED', 'CANCELLED'].includes(r.status1) && !['REJECTED', 'CANCELLED'].includes(r.status_final) && r.leave_type !== 'IMPORTED_SUMMARY' && r.start_date <= end && r.end_date >= start);
-  if (!c.length) return null;
-  if (type === 'FULL') return c[0];
-  return c.find((r) => ['FULL', 'IMPORTED', 'IMPORTED_HALF', 'HALF_IMPORTED', type].includes(r.leave_type)) || null;
+function requestSegments(s, request) {
+  const applicant = userById(s, request.user_id);
+  const settings = getWorkSettings(s, applicant?.company_id);
+  const fullStart = settings.work_start || DEFAULT_WORK.work_start;
+  const fullEnd = settings.work_end || DEFAULT_WORK.work_end;
+  const dates = Array.isArray(request.charge_dates) && request.charge_dates.length
+    ? request.charge_dates
+    : (request.start_date && request.end_date ? (() => { const out = []; let d = request.start_date; while (d <= request.end_date) { out.push(d); d = addDays(d, 1); } return out; })() : []);
+  if (request.leave_type === 'FULL' || request.leave_type === 'IMPORTED') return dates.map((date) => ({ date, start_time: fullStart, end_time: fullEnd, full: true }));
+  if (Array.isArray(request.hourly_segments) && request.hourly_segments.length) return request.hourly_segments.map((x) => ({ date: x.date, start_time: x.start_time, end_time: x.end_time, full: false }));
+  if (request.leave_type === 'HOURLY' && request.start_datetime && request.end_datetime) {
+    const start = parseLocalDateTime(request.start_datetime), end = parseLocalDateTime(request.end_datetime);
+    if (!start || !end) return [];
+    const out = [];
+    let d = start.date;
+    while (d <= end.date) {
+      out.push({ date: d, start_time: d === start.date ? start.time : fullStart, end_time: d === end.date ? end.time : fullEnd, full: false });
+      d = addDays(d, 1);
+    }
+    return out;
+  }
+  if (['AM_HALF', 'PM_HALF', 'IMPORTED_HALF', 'HALF_IMPORTED'].includes(request.leave_type)) {
+    return dates.map((date) => ({ date, start_time: request.start_time || (request.leave_type === 'AM_HALF' ? settings.work_start : settings.lunch_end), end_time: request.end_time || (request.leave_type === 'AM_HALF' ? settings.lunch_start : settings.work_end), full: false }));
+  }
+  return dates.map((date) => ({ date, start_time: request.start_time || fullStart, end_time: request.end_time || fullEnd, full: false }));
+}
+function timeSegmentsOverlap(a, b) {
+  if (a.date !== b.date) return false;
+  if (a.full || b.full) return true;
+  const as = timeToMinutes(a.start_time), ae = timeToMinutes(a.end_time), bs = timeToMinutes(b.start_time), be = timeToMinutes(b.end_time);
+  if ([as, ae, bs, be].some((v) => v == null)) return true;
+  return as < be && bs < ae;
+}
+function hasLeaveConflict(s, userId, type, start, end, calc = null) {
+  const existing = s.requests.filter((r) => r.user_id === Number(userId) && !['REJECTED', 'CANCELLED'].includes(r.status1) && !['REJECTED', 'CANCELLED'].includes(r.status_final) && r.leave_type !== 'IMPORTED_SUMMARY' && r.start_date <= end && r.end_date >= start);
+  if (!existing.length) return null;
+  if (type === 'FULL') return existing[0];
+  const candidate = calc?.hourly_segments?.length
+    ? calc.hourly_segments.map((x) => ({ date: x.date, start_time: x.start_time, end_time: x.end_time, full: false }))
+    : requestSegments(s, { user_id: Number(userId), leave_type: type, start_date: start, end_date: end, start_time: calc?.start_time || '', end_time: calc?.end_time || '', charge_dates: calc?.charge_dates || null });
+  for (const r of existing) {
+    const segments = requestSegments(s, r);
+    if (segments.some((x) => candidate.some((y) => timeSegmentsOverlap(x, y)))) return r;
+  }
+  return null;
 }
 
 function fixedSubstitute(map, date, name) {
@@ -443,18 +525,61 @@ function workingDateDetails(s, companyId, start, end) {
   }
   return { charge_dates: chargeDates, excluded_dates: excluded, holidays };
 }
-function calculateLeave(s, user, type, start, end) {
-  if (!['FULL', 'AM_HALF', 'PM_HALF'].includes(type)) throw new HttpError(400, '연차 신청 구분을 확인해 주세요.');
+function calculateHourlyLeave(s, user, startDateTime, endDateTime) {
+  const start = parseLocalDateTime(startDateTime), end = parseLocalDateTime(endDateTime);
+  if (!start || !end || cmpDateTime(end.raw, start.raw) <= 0) throw new HttpError(400, '시간단위 신청은 시작일시와 종료일시를 정확히 입력해 주세요.');
+  if (!isThirtyMinuteTime(start.time) || !isThirtyMinuteTime(end.time)) throw new HttpError(400, '시간단위 연차는 30분 단위로만 신청할 수 있습니다. 예: 09:00, 09:30');
+  const settings = getWorkSettings(s, user.company_id);
+  const workStart = timeToMinutes(settings.work_start), lunchStart = timeToMinutes(settings.lunch_start), lunchEnd = timeToMinutes(settings.lunch_end), workEnd = timeToMinutes(settings.work_end);
+  const workMinutes = workMinutesPerDay(settings);
+  const details = workingDateDetails(s, user.company_id, start.date, end.date);
+  const workingSet = new Set(details.charge_dates);
+  const hourlySegments = [];
+  let totalMinutes = 0;
+  let d = start.date;
+  while (d <= end.date) {
+    if (workingSet.has(d)) {
+      const dayStart = d === start.date ? start.minutes : workStart;
+      const dayEnd = d === end.date ? end.minutes : workEnd;
+      const blocks = [[workStart, lunchStart], [lunchEnd, workEnd]];
+      for (const [bs, be] of blocks) {
+        const segStart = Math.max(dayStart, bs), segEnd = Math.min(dayEnd, be);
+        if (segEnd > segStart) {
+          const minutes = segEnd - segStart;
+          totalMinutes += minutes;
+          hourlySegments.push({ date: d, start_time: minutesToTime(segStart), end_time: minutesToTime(segEnd), minutes, hours: roundHours(minutes / 60) });
+        }
+      }
+    }
+    d = addDays(d, 1);
+  }
+  if (totalMinutes <= 0) throw new HttpError(400, '근무시간 안에서 계산되는 시간단위 연차가 없습니다. 근무시간·휴일·점심시간을 확인해 주세요.');
+  if (totalMinutes % 30 !== 0) throw new HttpError(400, '시간단위 연차는 30분 단위로만 신청할 수 있습니다.');
+  const hours = roundHours(totalMinutes / 60);
+  return {
+    days: roundLeaveDays(totalMinutes / workMinutes), hours,
+    start_date: start.date, end_date: end.date, start_time: start.time, end_time: end.time,
+    start_datetime: start.raw, end_datetime: end.raw,
+    charge_dates: [...new Set(hourlySegments.map((x) => x.date))], hourly_segments: hourlySegments,
+    excluded_dates: details.excluded_dates, work_settings: settings, work_hours_per_day: roundHours(workMinutes / 60)
+  };
+}
+function calculateLeave(s, user, type, start, end, startDateTime = '', endDateTime = '') {
+  if (!['FULL', 'AM_HALF', 'PM_HALF', 'HOURLY'].includes(type)) throw new HttpError(400, '연차 신청 구분을 확인해 주세요.');
+  if (type === 'HOURLY') return calculateHourlyLeave(s, user, startDateTime, endDateTime);
   if (!parseIso(start) || !parseIso(end) || end < start) throw new HttpError(400, '신청 날짜를 정확히 입력해 주세요.');
   const settings = getWorkSettings(s, user.company_id);
+  const workHours = roundHours(workMinutesPerDay(settings) / 60);
   if (type !== 'FULL') end = start;
   const details = workingDateDetails(s, user.company_id, start, end);
   if (type !== 'FULL') {
     if (!details.charge_dates.includes(start)) throw new HttpError(400, '토·일요일 또는 휴일에는 반차를 신청할 수 없습니다.');
-    return { days: 0.5, start_date: start, end_date: start, start_time: type === 'AM_HALF' ? settings.work_start : settings.lunch_end, end_time: type === 'AM_HALF' ? settings.lunch_start : settings.work_end, charge_dates: [start], excluded_dates: [], work_settings: settings };
+    const startTime = type === 'AM_HALF' ? settings.work_start : settings.lunch_end;
+    const endTime = type === 'AM_HALF' ? settings.lunch_start : settings.work_end;
+    return { days: 0.5, hours: roundHours(workHours / 2), start_date: start, end_date: start, start_time: startTime, end_time: endTime, start_datetime: `${start}T${startTime}`, end_datetime: `${start}T${endTime}`, charge_dates: [start], hourly_segments: [{ date: start, start_time: startTime, end_time: endTime, minutes: workMinutesPerDay(settings) / 2, hours: roundHours(workHours / 2) }], excluded_dates: [], work_settings: settings, work_hours_per_day: workHours };
   }
   if (!details.charge_dates.length) throw new HttpError(400, '선택한 기간에 연차 사용일로 계산되는 근무일이 없습니다.');
-  return { days: details.charge_dates.length, start_date: start, end_date: end, start_time: settings.work_start, end_time: settings.work_end, charge_dates: details.charge_dates, excluded_dates: details.excluded_dates, work_settings: settings };
+  return { days: details.charge_dates.length, hours: roundHours(details.charge_dates.length * workHours), start_date: start, end_date: end, start_time: settings.work_start, end_time: settings.work_end, start_datetime: `${start}T${settings.work_start}`, end_datetime: `${end}T${settings.work_end}`, charge_dates: details.charge_dates, hourly_segments: null, excluded_dates: details.excluded_dates, work_settings: settings, work_hours_per_day: workHours };
 }
 
 function renewalRows(s, ym, companyId = null, asOf = todayIsoKst()) {
@@ -537,7 +662,7 @@ async function handle(context) {
   const { request, env } = context; await initDb(env); const { version, state: s } = await loadState(env);
   const url = new URL(request.url), pathname = url.pathname, method = request.method, body = await parseBody(request);
 
-  if (method === 'GET' && pathname === '/api/health') return json({ ok: true, service: 'dnm-annual-leave-manager-netlify-v8', date: todayIsoKst(), storage: 'Netlify Blobs' });
+  if (method === 'GET' && pathname === '/api/health') return json({ ok: true, service: 'dnm-annual-leave-manager-netlify-v8.1-hourly', date: todayIsoKst(), storage: 'Netlify Blobs' });
   if (method === 'GET' && pathname === '/api/initial-info') return json({ company_count: s.companies.filter((c) => c.active).length, employee_count: s.users.filter((u) => !u.is_system_account && !u.deleted && !hasRetireDate(u)).length, source: s.source_verification || null, version: APP_VERSION });
 
   if (method === 'POST' && pathname === '/api/login') {
@@ -588,24 +713,27 @@ async function handle(context) {
   if (method === 'POST' && pathname === '/api/calculate-leave') {
     const u = await requireAuth(request, env, s); if (u.is_system_account || u.company_id == null) throw new HttpError(400, '직원 본인 계정만 계산할 수 있습니다.');
     const type = cleanText(body.leave_type, 30), start = cleanText(body.start_date, 10), end = cleanText(body.end_date || body.start_date, 10);
-    return json(calculateLeave(s, u, type, start, end));
+    return json(calculateLeave(s, u, type, start, end, cleanText(body.start_datetime, 16), cleanText(body.end_datetime, 16)));
   }
   if (method === 'POST' && pathname === '/api/leave-requests') {
     const u = await requireAuth(request, env, s);
     if (u.is_system_account || u.company_id == null) throw new HttpError(400, '직원 본인 계정만 연차를 신청할 수 있습니다.');
     const type = cleanText(body.leave_type, 30);
     let start = cleanText(body.start_date, 10), end = cleanText(body.end_date, 10);
+    const startDateTime = cleanText(body.start_datetime, 16), endDateTime = cleanText(body.end_datetime, 16);
     const reason = cleanText(body.reason, 500);
     const rawIds = Array.isArray(body.approver_ids) ? body.approver_ids : (body.approver1_id ? [body.approver1_id] : []);
     const approverIds = [...new Set(rawIds.map(numberId).filter(Boolean))];
     if (!approverIds.length) throw new HttpError(400, '1명 이상의 승인자를 선택해 주세요.');
     if (approverIds.length > 10) throw new HttpError(400, '승인자는 최대 10명까지 지정할 수 있습니다.');
-    if (start < todayIsoKst()) throw new HttpError(400, '지난 날짜는 새로 신청할 수 없습니다.');
-    const calc = calculateLeave(s, u, type, start, end); start = calc.start_date; end = calc.end_date;
+    const requestedStartDate = type === 'HOURLY' ? (parseLocalDateTime(startDateTime)?.date || '') : start;
+    if (!requestedStartDate) throw new HttpError(400, '신청 시작일 또는 시작일시를 확인해 주세요.');
+    if (requestedStartDate < todayIsoKst()) throw new HttpError(400, '지난 날짜는 새로 신청할 수 없습니다.');
+    const calc = calculateLeave(s, u, type, start, end, startDateTime, endDateTime); start = calc.start_date; end = calc.end_date;
     const approvers = approverIds.map((id) => userById(s, id));
     if (approvers.some((a) => !userAvailable(a) || a.is_system_account || a.company_id !== u.company_id || !a.can_approve_first)) throw new HttpError(400, '승인자는 관리자 메뉴에서 “연차 승인자”로 체크된 같은 회사 재직 직원만 선택할 수 있습니다.');
     if (approvers.some((a) => a.id === u.id)) throw new HttpError(400, '신청자 본인을 승인자로 선택할 수 없습니다.');
-    if (hasLeaveConflict(s, u.id, type, start, end)) throw new HttpError(400, '같은 날짜에 이미 등록되거나 신청 중인 연차가 있습니다.');
+    if (hasLeaveConflict(s, u.id, type, start, end, calc)) throw new HttpError(400, '같은 날짜 또는 시간대에 이미 등록되거나 신청 중인 연차가 있습니다.');
     const t = nowIso();
     const approvalSteps = approvers.map((a, index) => ({ order: index + 1, approver_id: a.id, role: index === approvers.length - 1 ? 'REPRESENTATIVE' : 'APPROVER', status: index === 0 ? 'PENDING' : 'WAITING', action_at: null, comment: '' }));
     const finalApprover = approvers[approvers.length - 1];
@@ -613,12 +741,13 @@ async function handle(context) {
       id: s.counters.request++, user_id: u.id, approver1_id: approvers[0].id, final_approver_id: finalApprover.id,
       approval_steps: approvalSteps, approval_state: 'PENDING',
       leave_type: type, start_date: start, end_date: end, start_time: calc.start_time, end_time: calc.end_time,
-      charge_dates: calc.charge_dates, days: calc.days, reason, status1: 'PENDING', status_final: 'WAITING',
+      start_datetime: calc.start_datetime || '', end_datetime: calc.end_datetime || '',
+      charge_dates: calc.charge_dates, hourly_segments: calc.hourly_segments || null, days: calc.days, hours: calc.hours, reason, status1: 'PENDING', status_final: 'WAITING',
       reject_reason: '', source: 'APPLICATION', source_note: '', created_at: t, updated_at: t,
       approved1_at: null, final_approved_at: null, cancelled_at: null
     };
     s.requests.push(rec); await saveState(env, version, s);
-    return json({ ok: true, id: rec.id, days: rec.days, excluded_dates: calc.excluded_dates, start_time: rec.start_time, end_time: rec.end_time, approval_steps: requestRow(s, rec).approval_line });
+    return json({ ok: true, id: rec.id, days: rec.days, hours: rec.hours, excluded_dates: calc.excluded_dates, start_time: rec.start_time, end_time: rec.end_time, start_datetime: rec.start_datetime, end_datetime: rec.end_datetime, approval_steps: requestRow(s, rec).approval_line });
   }
   if (method === 'GET' && pathname === '/api/my-requests') {
     const u = await requireAuth(request, env, s); return json(allRequestRows(s).filter((r) => r.user_id === u.id));

@@ -23,7 +23,23 @@ const esc = (value) => String(value == null ? '' : value)
   .replaceAll('"', '&quot;').replaceAll("'", '&#039;');
 const qs = (selector, root = document) => root.querySelector(selector);
 const qsa = (selector, root = document) => [...root.querySelectorAll(selector)];
-const fmt = (value) => Number(value || 0).toLocaleString('ko-KR', { maximumFractionDigits: 1 });
+const fmt = (value) => Number(value || 0).toLocaleString('ko-KR', { maximumFractionDigits: 2 });
+const fmtHours = (value) => Number(value || 0).toLocaleString('ko-KR', { maximumFractionDigits: 1 });
+const workHoursPerDay = () => Number(me?.work_hours_per_day || 8);
+function amountDays(value) { return typeof value === 'object' && value ? Number(value.days || 0) : Number(value || 0); }
+function amountHours(value) { return typeof value === 'object' && value && Number.isFinite(Number(value.hours)) ? Number(value.hours) : amountDays(value) * workHoursPerDay(); }
+function formatLeaveAmount(value, options = {}) {
+  const days = amountDays(value), hours = amountHours(value);
+  if (options.preferHours || (typeof value === 'object' && value?.leave_type === 'HOURLY')) return `${fmtHours(hours)}시간 (${fmt(days)}일)`;
+  if (options.compact) return `${fmt(days)}일 / ${fmtHours(hours)}시간`;
+  return `${fmt(days)}일 / ${fmtHours(hours)}시간`;
+}
+function formatBalance(key) {
+  const days = Number(me?.[key] || 0);
+  const hours = Number(me?.[`${key}_hours`] ?? (days * workHoursPerDay()));
+  return `${fmt(days)}<span class="stat-unit">일</span><div class="muted small-text">${fmtHours(hours)}시간</div>`;
+}
+function dateTimeLabel(value) { return String(value || '').replace('T', ' '); }
 const today = () => {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
   const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
@@ -95,7 +111,7 @@ function statusInfo(row) {
 
 function leaveTypeLabel(type) {
   return ({
-    FULL: '연차/기간', AM_HALF: '오전 반차', PM_HALF: '오후 반차',
+    FULL: '연차/기간', AM_HALF: '오전 반차', PM_HALF: '오후 반차', HOURLY: '시간 연차',
     IMPORTED_HALF: '반차(기존자료)', HALF_IMPORTED: '반차(기존자료)', IMPORTED_SUMMARY: '연도합계(기존자료)',
     IMPORTED: '기존자료'
   })[type] || type;
@@ -209,10 +225,10 @@ async function dashboardPage() {
     ${pageTitle('대시보드', `${me.as_of} 기준 · 입사일 기준 현재 1년 주기의 연차 현황입니다.`)}
     ${me.must_change_password ? '<div class="notice warning"><strong>최초 비밀번호 1111을 사용 중입니다.</strong> 안전한 사용을 위해 “비밀번호 변경” 메뉴에서 본인만의 비밀번호로 바꾸세요.</div>' : ''}
     <section class="stats">
-      <div class="stat-card"><div class="stat-label">현재 주기 발생</div><div class="stat-value">${fmt(me.granted)}<span class="stat-unit">일</span></div></div>
-      <div class="stat-card"><div class="stat-label">현재 주기 사용</div><div class="stat-value">${fmt(me.used)}<span class="stat-unit">일</span></div></div>
+      <div class="stat-card"><div class="stat-label">현재 주기 발생</div><div class="stat-value">${formatBalance('granted')}</div></div>
+      <div class="stat-card"><div class="stat-label">현재 주기 사용</div><div class="stat-value">${formatBalance('used')}</div></div>
       <div class="stat-card"><div class="stat-label">승인 대기 중</div><div class="stat-value">${fmt(me.pending)}<span class="stat-unit">일</span></div></div>
-      <div class="stat-card primary"><div class="stat-label">현재 잔여</div><div class="stat-value ${me.remaining < 0 ? 'negative' : ''}">${fmt(me.remaining)}<span class="stat-unit">일</span></div></div>
+      <div class="stat-card primary"><div class="stat-label">현재 잔여</div><div class="stat-value ${me.remaining < 0 ? 'negative' : ''}">${formatBalance('remaining')}</div></div>
     </section>
     <div class="notice ${me.remaining <= 0 ? 'warning' : ''}"><strong>잔여 연차가 0일 또는 음수여도 연차 신청은 가능합니다.</strong> 승인 대기까지 포함한 예상 잔여는 ${fmt(me.projected_remaining)}일입니다.</div>
     <div class="grid cols-2">
@@ -223,7 +239,7 @@ async function dashboardPage() {
           <tr><td class="muted">현재 연차 주기</td><td class="right strong">${esc(me.cycle_start)} ~ ${esc(me.cycle_end)}</td></tr>
           <tr><td class="muted">현재 주기 발생</td><td class="right strong">${fmt(me.granted)}일</td></tr>
           <tr><td class="muted">관리자 조정</td><td class="right strong ${me.adjustments < 0 ? 'negative' : me.adjustments > 0 ? 'positive' : ''}">${fmt(me.adjustments)}일</td></tr>
-          <tr><td class="muted">현재 잔여</td><td class="right strong ${me.remaining < 0 ? 'negative' : ''}">${fmt(me.remaining)}일</td></tr>
+          <tr><td class="muted">현재 잔여</td><td class="right strong ${me.remaining < 0 ? 'negative' : ''}">${fmt(me.remaining)}일 / ${fmtHours(me.remaining_hours)}시간</td></tr>
           <tr><td class="muted">다음 갱신일</td><td class="right strong">${esc(me.next_anniversary)} / ${fmt(me.next_entitlement)}일 새로 생성</td></tr>
         </tbody></table></div>
       </section>
@@ -293,7 +309,7 @@ async function applyPage() {
         approver1_id: qs('#approver-first').value, final_approver_id: qs('#approver-final').value,
         reason: qs('#leave-reason').value
       } });
-      toast(`${fmt(result.days)}일 연차가 신청되었습니다.`);
+      toast(`${formatLeaveAmount(result)} 연차가 신청되었습니다.`);
       await refreshMe();
       go('history');
     } catch (error) { toast(error.message, 'error'); submit.disabled = false; }
@@ -323,9 +339,9 @@ async function historyPage() {
       return true;
     });
     qs('#history-table').innerHTML = `<section class="card"><div class="card-header"><h3>총 ${filtered.length}건</h3><span class="muted">최종 승인 사용 합계 ${fmt(filtered.filter((r) => statusInfo(r)[0] === '최종승인').reduce((s, r) => s + Number(r.days), 0))}일</span></div>
-      <div class="table-wrap"><table class="data-table"><thead><tr><th>구분</th><th>기간</th><th>일수</th><th>승인자</th><th>상태</th><th>사유</th><th>자료구분</th><th>처리</th></tr></thead><tbody>
+      <div class="table-wrap"><table class="data-table"><thead><tr><th>구분</th><th>기간</th><th>일수/시간</th><th>승인자</th><th>상태</th><th>사유</th><th>자료구분</th><th>처리</th></tr></thead><tbody>
       ${filtered.length ? filtered.map((r) => { const [label, color] = statusInfo(r); const cancellable = r.source === 'APPLICATION' && !['최종승인', '반려', '취소'].includes(label); return `<tr>
-        <td class="center"><span class="badge blue">${esc(leaveTypeLabel(r.leave_type))}</span></td><td class="center nowrap">${esc(r.start_date)}${r.end_date !== r.start_date ? ` ~ ${esc(r.end_date)}` : ''}</td><td class="right strong">${fmt(r.days)}</td>
+        <td class="center"><span class="badge blue">${esc(leaveTypeLabel(r.leave_type))}</span></td><td class="center nowrap">${esc(r.start_date)}${r.end_date !== r.start_date ? ` ~ ${esc(r.end_date)}` : ''}</td><td class="right strong">${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</td>
         <td><div>1차: ${esc(r.approver1_name || '-')}</div><div>최종: ${esc(r.final_approver_name || '-')}</div></td><td class="center"><span class="badge ${color}">${label}</span>${r.reject_reason ? `<div class="small-text negative" style="margin-top:4px">${esc(r.reject_reason)}</div>` : ''}</td>
         <td>${esc(r.reason || '-')}</td><td class="center"><span class="badge ${r.source === 'APPLICATION' ? 'blue' : 'gray'}">${r.source === 'APPLICATION' ? '시스템 신청' : '엑셀 이관'}</span></td>
         <td class="center">${cancellable ? `<button class="btn red small cancel-request" data-id="${r.id}">취소</button>` : '-'}</td></tr>`; }).join('') : '<tr><td colspan="8" class="empty">조건에 맞는 내역이 없습니다.</td></tr>'}
@@ -340,10 +356,10 @@ async function inboxPage() {
   qs('#page').innerHTML = `
     ${pageTitle('승인함', '본인에게 지정되어 현재 처리할 수 있는 신청만 표시됩니다.')}
     <section class="card"><div class="card-header"><h3>처리 대기 ${rows.length}건</h3></div>
-      <div class="table-wrap"><table class="data-table"><thead><tr><th>승인단계</th><th>회사·신청자</th><th>구분</th><th>기간</th><th>일수</th><th>사유</th><th>처리</th></tr></thead><tbody>
+      <div class="table-wrap"><table class="data-table"><thead><tr><th>승인단계</th><th>회사·신청자</th><th>구분</th><th>기간</th><th>일수/시간</th><th>사유</th><th>처리</th></tr></thead><tbody>
       ${rows.length ? rows.map((r) => `<tr><td class="center"><span class="badge ${r.stage === 'FIRST' ? 'blue' : 'green'}">${r.stage === 'FIRST' ? '1차 승인' : '최종 승인'}</span></td>
         <td><div class="name">${esc(r.applicant_name)}</div><div class="muted small-text">${esc(r.company_name)} · ${esc(r.department || '-')}</div></td><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td>
-        <td class="center nowrap">${esc(r.start_date)}${r.end_date !== r.start_date ? ` ~ ${esc(r.end_date)}` : ''}</td><td class="right strong">${fmt(r.days)}</td><td>${esc(r.reason || '-')}</td>
+        <td class="center nowrap">${esc(r.start_date)}${r.end_date !== r.start_date ? ` ~ ${esc(r.end_date)}` : ''}</td><td class="right strong">${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</td><td>${esc(r.reason || '-')}</td>
         <td class="center"><div class="actions" style="justify-content:center"><button class="btn green small approve" data-id="${r.id}">승인</button><button class="btn red small reject" data-id="${r.id}">반려</button></div></td></tr>`).join('') : '<tr><td colspan="7" class="empty">현재 처리할 신청이 없습니다.</td></tr>'}
       </tbody></table></div></section>`;
   qsa('.approve').forEach((button) => { button.onclick = async () => { if (!confirm('이 신청을 승인하시겠습니까?')) return; try { await api(`/api/requests/${button.dataset.id}/action`, { method: 'POST', body: { action: 'approve' } }); toast('승인 처리되었습니다.'); inboxPage(); } catch (e) { toast(e.message, 'error'); } }; });
@@ -502,7 +518,7 @@ async function adminRequests() {
     const p = new URLSearchParams(); const values = [['company_id', '#req-company'], ['from', '#req-from'], ['to', '#req-to'], ['status', '#req-status'], ['source', '#req-source']]; values.forEach(([k, s]) => { if (qs(s).value) p.set(k, qs(s).value); });
     const rows = await api(`/api/admin/requests?${p}`);
     const shown = rows.slice(0, 500);
-    qs('#request-table').innerHTML = `<section class="card"><div class="card-header"><h3>조회 ${rows.length}건</h3><span class="muted">${rows.length > 500 ? '화면에는 최근 500건만 표시합니다. Excel에는 전체가 포함됩니다.' : ''}</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>회사</th><th>직원</th><th>구분</th><th>기간</th><th>일수</th><th>상태</th><th>승인라인</th><th>사유·반려사유</th><th>자료</th></tr></thead><tbody>${shown.length ? shown.map((r) => { const [label, color] = statusInfo(r); return `<tr><td class="center">${esc(r.company_name)}</td><td><div class="name">${esc(r.applicant_name)}</div><div class="muted small-text">${esc(r.applicant_login)}</div></td><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center nowrap">${esc(r.start_date)}${r.end_date !== r.start_date ? ` ~ ${esc(r.end_date)}` : ''}</td><td class="right strong">${fmt(r.days)}</td><td class="center"><span class="badge ${color}">${label}</span></td><td>${approvalLineHtml(r, true)}</td><td>${esc(r.reason || '-')}${r.reject_reason ? `<div class="negative small-text">반려: ${esc(r.reject_reason)}</div>` : ''}</td><td class="center"><span class="badge gray">${r.source === 'APPLICATION' ? '시스템' : '엑셀'}</span></td></tr>`; }).join('') : '<tr><td colspan="9" class="empty">조회 결과가 없습니다.</td></tr>'}</tbody></table></div></section>`;
+    qs('#request-table').innerHTML = `<section class="card"><div class="card-header"><h3>조회 ${rows.length}건</h3><span class="muted">${rows.length > 500 ? '화면에는 최근 500건만 표시합니다. Excel에는 전체가 포함됩니다.' : ''}</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>회사</th><th>직원</th><th>구분</th><th>기간</th><th>일수/시간</th><th>상태</th><th>승인라인</th><th>사유·반려사유</th><th>자료</th></tr></thead><tbody>${shown.length ? shown.map((r) => { const [label, color] = statusInfo(r); return `<tr><td class="center">${esc(r.company_name)}</td><td><div class="name">${esc(r.applicant_name)}</div><div class="muted small-text">${esc(r.applicant_login)}</div></td><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center nowrap">${esc(r.start_date)}${r.end_date !== r.start_date ? ` ~ ${esc(r.end_date)}` : ''}</td><td class="right strong">${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</td><td class="center"><span class="badge ${color}">${label}</span></td><td>${approvalLineHtml(r, true)}</td><td>${esc(r.reason || '-')}${r.reject_reason ? `<div class="negative small-text">반려: ${esc(r.reject_reason)}</div>` : ''}</td><td class="center"><span class="badge gray">${r.source === 'APPLICATION' ? '시스템' : '엑셀'}</span></td></tr>`; }).join('') : '<tr><td colspan="9" class="empty">조회 결과가 없습니다.</td></tr>'}</tbody></table></div></section>`;
   };
   qs('#req-search').onclick = load;
   qs('#req-export').onclick = async () => { try { await downloadFullExport(qs('#req-company').value); } catch (e) { toast(e.message, 'error'); } };
@@ -530,6 +546,9 @@ async function passwordPage() {
 let currentAdminTabV6 = 'users';
 
 function requestPeriodLabel(r) {
+  if (r.leave_type === 'HOURLY' && r.start_datetime && r.end_datetime) {
+    return `${esc(dateTimeLabel(r.start_datetime))}<div class="muted small-text">~ ${esc(dateTimeLabel(r.end_datetime))}</div>`;
+  }
   const datePart = r.end_date && r.end_date !== r.start_date ? `${esc(r.start_date)} ~ ${esc(r.end_date)}` : esc(r.start_date || '');
   const timePart = r.start_time && r.end_time ? `<div class="muted small-text">${esc(r.start_time)} ~ ${esc(r.end_time)}</div>` : '';
   return `${datePart}${timePart}`;
@@ -602,24 +621,24 @@ async function dashboardPageV6(requestId = pageRequestId, alreadyRefreshed = fal
     ${pageTitle('대시보드', `${me.as_of} 기준 · 기존 Excel 사용자료와 현재 1년 주기를 함께 보여줍니다.`)}
     ${me.must_change_password ? '<div class="notice warning"><strong>최초 비밀번호 1111을 사용 중입니다.</strong> “비밀번호 변경” 메뉴에서 변경하세요.</div>' : ''}
     <section class="stats stats-5">
-      <div class="stat-card"><div class="stat-label">현재 주기 발생</div><div class="stat-value">${fmt(me.granted)}<span class="stat-unit">일</span></div></div>
-      <div class="stat-card"><div class="stat-label">현재 주기 사용</div><div class="stat-value">${fmt(me.used)}<span class="stat-unit">일</span></div></div>
-      <div class="stat-card"><div class="stat-label">누적 사용(Excel 포함)</div><div class="stat-value">${fmt(me.total_used)}<span class="stat-unit">일</span></div></div>
-      <div class="stat-card"><div class="stat-label">승인 대기</div><div class="stat-value">${fmt(me.pending)}<span class="stat-unit">일</span></div></div>
-      <div class="stat-card primary"><div class="stat-label">현재 잔여</div><div class="stat-value ${me.remaining < 0 ? 'negative' : ''}">${fmt(me.remaining)}<span class="stat-unit">일</span></div></div>
+      <div class="stat-card"><div class="stat-label">현재 주기 발생</div><div class="stat-value">${formatBalance('granted')}</div></div>
+      <div class="stat-card"><div class="stat-label">현재 주기 사용</div><div class="stat-value">${formatBalance('used')}</div></div>
+      <div class="stat-card"><div class="stat-label">누적 사용(Excel 포함)</div><div class="stat-value">${fmt(me.total_used)}<span class="stat-unit">일</span><div class="muted small-text">${fmtHours(me.total_used_hours)}시간</div></div></div>
+      <div class="stat-card"><div class="stat-label">승인 대기</div><div class="stat-value">${formatBalance('pending')}</div></div>
+      <div class="stat-card primary"><div class="stat-label">현재 잔여</div><div class="stat-value ${me.remaining < 0 ? 'negative' : ''}">${formatBalance('remaining')}</div></div>
     </section>
-    <div class="notice ${me.remaining <= 0 ? 'warning' : ''}"><strong>잔여가 0일 또는 음수여도 신청할 수 있습니다.</strong> 승인대기 포함 예상 잔여는 ${fmt(me.projected_remaining)}일입니다.</div>
+    <div class="notice ${me.remaining <= 0 ? 'warning' : ''}"><strong>잔여가 0일 또는 음수여도 신청할 수 있습니다.</strong> 승인대기 포함 예상 잔여는 ${fmt(me.projected_remaining)}일 / ${fmtHours(me.projected_remaining_hours)}시간입니다.</div>
     <div class="grid cols-2">
       <section class="card"><h3>입사일 기준 연차 주기</h3><div class="table-wrap"><table class="data-table compact-table"><tbody>
         <tr><td class="muted">회사 / 부서</td><td class="right strong">${esc(me.company_name)} / ${esc(me.department || '-')}</td></tr>
         <tr><td class="muted">입사일 / 근속</td><td class="right strong">${esc(me.join_date)} / ${esc(me.tenure)}</td></tr>
         <tr><td class="muted">현재 연차 주기</td><td class="right strong">${esc(me.cycle_start)} ~ ${esc(me.cycle_end)}</td></tr>
-        <tr><td class="muted">현재 주기 사용</td><td class="right strong">${fmt(me.used)}일</td></tr>
+        <tr><td class="muted">현재 주기 사용</td><td class="right strong">${fmt(me.used)}일 / ${fmtHours(me.used_hours)}시간</td></tr>
         <tr><td class="muted">기존 Excel 누적 사용</td><td class="right strong">${fmt(me.source_used ?? me.total_used)}일</td></tr>
-        <tr><td class="muted">현재 잔여</td><td class="right strong ${me.remaining < 0 ? 'negative' : ''}">${fmt(me.remaining)}일</td></tr>
+        <tr><td class="muted">현재 잔여</td><td class="right strong ${me.remaining < 0 ? 'negative' : ''}">${fmt(me.remaining)}일 / ${fmtHours(me.remaining_hours)}시간</td></tr>
         <tr><td class="muted">다음 갱신일</td><td class="right strong">${esc(me.next_anniversary)} / ${fmt(me.next_entitlement)}일 생성</td></tr>
       </tbody></table></div></section>
-      <section class="card"><h3>연차 운영 방식</h3><div class="help-steps"><div class="help-step"><strong>반차</strong><div class="muted small-text">오전/오후를 선택하면 기준정보의 근무시간으로 0.5일 자동 계산합니다.</div></div><div class="help-step"><strong>기간</strong><div class="muted small-text">토·일요일, 국가공휴일, 대체공휴일, 회사 추가휴일을 자동 제외합니다.</div></div><div class="help-step"><strong>입사기념일 갱신</strong><div class="muted small-text">1년이 되면 15일, 이후 2년마다 1일 증가하여 최대 25일입니다.</div></div></div></section>
+      <section class="card"><h3>연차 운영 방식</h3><div class="help-steps"><div class="help-step"><strong>반차·시간단위</strong><div class="muted small-text">오전/오후 반차는 0.5일, 시간단위 연차는 30분 단위로 신청하며 30분은 0.5시간으로 표시합니다.</div></div><div class="help-step"><strong>기간</strong><div class="muted small-text">토·일요일, 국가공휴일, 대체공휴일, 회사 추가휴일을 자동 제외합니다.</div></div><div class="help-step"><strong>입사기념일 갱신</strong><div class="muted small-text">1년이 되면 15일, 이후 2년마다 1일 증가하여 최대 25일입니다.</div></div></div></section>
     </div>`;
 }
 
@@ -644,7 +663,7 @@ async function adminDashboardPage(requestId = pageRequestId) {
     dashBody.innerHTML = `
       <section class="stats"><div class="stat-card"><div class="stat-label">조회 직원</div><div class="stat-value">${stats.employee_count}<span class="stat-unit">명</span></div></div><div class="stat-card"><div class="stat-label">승인 대기</div><div class="stat-value">${stats.pending_count}<span class="stat-unit">건</span></div></div><div class="stat-card"><div class="stat-label">금년 승인 사용</div><div class="stat-value">${fmt(stats.approved_this_year)}<span class="stat-unit">일</span></div></div><div class="stat-card primary"><div class="stat-label">현재잔여 합계</div><div class="stat-value">${fmt(totalRemaining)}<span class="stat-unit">일</span></div></div></section>
       <section class="card"><div class="card-header"><h3>직원 연차 현황</h3><span class="muted">기존 Excel 누적 사용일수 포함</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>회사</th><th>직원</th><th>입사일</th><th>퇴사일</th><th>상태</th><th>현재주기</th><th>발생</th><th>주기사용</th><th>누적사용</th><th>잔여</th><th>대기</th></tr></thead><tbody>${users.map((u) => `<tr><td class="center">${esc(u.company_name)}</td><td><div class="name">${esc(u.employee_name)}</div><div class="muted small-text">${esc(u.department || '-')} · ${esc(u.login_id)}</div></td><td class="center">${esc(u.join_date)}</td><td class="center ${u.retire_date ? 'negative' : ''}">${esc(u.retire_date || '-')}</td><td class="center"><span class="badge ${u.employment_status === '재직' ? 'green' : 'amber'}">${esc(u.employment_status)}</span></td><td class="center nowrap">${esc(u.cycle_start)} ~ ${esc(u.cycle_end)}</td><td class="right">${fmt(u.granted)}</td><td class="right">${fmt(u.used)}</td><td class="right strong">${fmt(u.total_used)}</td><td class="right strong ${u.remaining < 0 ? 'negative' : ''}">${fmt(u.remaining)}</td><td class="right">${fmt(u.pending)}</td></tr>`).join('') || '<tr><td colspan="11" class="empty">조회 직원이 없습니다.</td></tr>'}</tbody></table></div></section>
-      <div class="grid cols-2"><section class="card"><div class="card-header"><h3>승인 대기 최근 ${Math.min(8, pending.length)}건</h3></div>${pending.slice(0, 8).map((r) => `<div class="summary-row"><div><strong>${esc(r.applicant_name)}</strong> · ${esc(leaveTypeLabel(r.leave_type))}<div class="muted small-text">${requestPeriodLabel(r)} · ${fmt(r.days)}일</div></div><span class="badge amber">대기</span></div>`).join('') || '<div class="empty">승인 대기가 없습니다.</div>'}</section><section class="card"><div class="card-header"><h3>금년 승인 최근 ${Math.min(8, approved.length)}건</h3></div>${approved.slice(0, 8).map((r) => `<div class="summary-row"><div><strong>${esc(r.applicant_name)}</strong> · ${esc(leaveTypeLabel(r.leave_type))}<div class="muted small-text">${requestPeriodLabel(r)} · ${fmt(r.days)}일</div></div><span class="badge green">승인</span></div>`).join('') || '<div class="empty">승인내역이 없습니다.</div>'}</section></div>`;
+      <div class="grid cols-2"><section class="card"><div class="card-header"><h3>승인 대기 최근 ${Math.min(8, pending.length)}건</h3></div>${pending.slice(0, 8).map((r) => `<div class="summary-row"><div><strong>${esc(r.applicant_name)}</strong> · ${esc(leaveTypeLabel(r.leave_type))}<div class="muted small-text">${requestPeriodLabel(r)} · ${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</div></div><span class="badge amber">대기</span></div>`).join('') || '<div class="empty">승인 대기가 없습니다.</div>'}</section><section class="card"><div class="card-header"><h3>금년 승인 최근 ${Math.min(8, approved.length)}건</h3></div>${approved.slice(0, 8).map((r) => `<div class="summary-row"><div><strong>${esc(r.applicant_name)}</strong> · ${esc(leaveTypeLabel(r.leave_type))}<div class="muted small-text">${requestPeriodLabel(r)} · ${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</div></div><span class="badge green">승인</span></div>`).join('') || '<div class="empty">승인내역이 없습니다.</div>'}</section></div>`;
   };
   qs('#dash-employment').onchange = load; await load();
 }
@@ -656,8 +675,10 @@ async function applyPageV6() {
     ${pageTitle('연차 신청', '휴대폰에서도 오전반차·오후반차·하루·기간을 빠르게 신청할 수 있습니다.')}
     ${noApprover ? '<div class="notice danger"><strong>승인자가 등록되지 않았습니다.</strong> 관리자에게 승인권한 설정을 요청하세요.</div>' : ''}
     <section class="card mobile-apply"><form id="leave-form">
-      <label class="field"><span>신청 구분</span><div class="leave-type-pills"><label><input type="radio" name="leave-type-radio" value="FULL" checked><span>하루 / 기간</span></label><label><input type="radio" name="leave-type-radio" value="AM_HALF"><span>오전 반차</span></label><label><input type="radio" name="leave-type-radio" value="PM_HALF"><span>오후 반차</span></label></div></label>
-      <div class="grid cols-2 date-grid"><label class="field"><span>시작일</span><input id="start-date" type="date" min="${today()}" required></label><label class="field" id="end-field"><span>종료일</span><input id="end-date" type="date" min="${today()}" required></label></div>
+      <label class="field"><span>신청 구분</span><div class="leave-type-pills"><label><input type="radio" name="leave-type-radio" value="FULL" checked><span>하루 / 기간</span></label><label><input type="radio" name="leave-type-radio" value="AM_HALF"><span>오전 반차</span></label><label><input type="radio" name="leave-type-radio" value="PM_HALF"><span>오후 반차</span></label><label><input type="radio" name="leave-type-radio" value="HOURLY"><span>⏱ 시간단위</span></label></div></label>
+      <div class="grid cols-2 date-grid" id="date-fields"><label class="field"><span>시작일</span><input id="start-date" type="date" min="${today()}" required></label><label class="field" id="end-field"><span>종료일</span><input id="end-date" type="date" min="${today()}" required></label></div>
+      <div class="grid cols-2 date-grid" id="datetime-fields" style="display:none"><label class="field"><span>시작일시</span><input id="start-datetime" type="datetime-local" min="${today()}T00:00" step="1800"></label><label class="field"><span>종료일시</span><input id="end-datetime" type="datetime-local" min="${today()}T00:00" step="1800"></label></div>
+      <div class="notice" id="hourly-guide" style="display:none;margin-top:10px">시간단위 연차는 <strong>YYYY-MM-DD HH:MM ~ YYYY-MM-DD HH:MM</strong> 형식으로 신청하며, <strong>30분 단위</strong>만 가능합니다. 30분은 <strong>0.5시간</strong>으로 표시됩니다.</div>
       <div id="day-preview" class="calc-preview">날짜를 계산하는 중입니다.</div>
       <div class="grid cols-2"><label class="field"><span>연차 승인자</span><select id="approver-first" required><option value="">선택</option>${approvers.first.map((a) => `<option value="${a.id}">${esc(a.employee_name)} · ${esc(a.position || a.department || '')}</option>`).join('')}</select></label><label class="field"><span>최종 결재</span><select id="approver-final" required><option value="">선택</option>${approvers.final.map((a) => `<option value="${a.id}">${esc(a.employee_name)} · ${esc(a.position || a.department || '')}</option>`).join('')}</select></label></div>
       <label class="field" style="margin-top:14px"><span>신청 사유</span><textarea id="leave-reason" placeholder="간단한 사유 또는 업무 인수인계 사항"></textarea></label>
@@ -684,7 +705,7 @@ async function applyPageV6() {
     event.preventDefault(); const submit = qs('button[type=submit]', event.currentTarget); submit.disabled = true;
     try {
       const result = await api('/api/leave-requests', { method: 'POST', body: { leave_type: selectedType(), start_date: start.value, end_date: end.value, approver1_id: qs('#approver-first').value, final_approver_id: qs('#approver-final').value, reason: qs('#leave-reason').value } });
-      toast(`${fmt(result.days)}일 연차가 신청되었습니다.`); await refreshMe(); goV6('history');
+      toast(`${formatLeaveAmount(result)} 연차가 신청되었습니다.`); await refreshMe(); goV6('history');
     } catch (error) { toast(error.message, 'error'); submit.disabled = false; }
   };
 }
@@ -693,11 +714,11 @@ async function historyPageV6() {
   const rows = await api('/api/my-requests'); const years = [...new Set(rows.map((r) => r.start_date.slice(0, 4)))].sort().reverse();
   const pageEl = qs('#page');
   if (!pageEl) return;
-  pageEl.innerHTML = `${pageTitle('나의 사용내역', '기존 Excel 자료와 시스템 신청자료를 함께 확인합니다.')}<div class="notice success"><strong>누적 최종승인 사용 ${fmt(me.total_used)}일</strong> · 기존 Excel 사용일수도 포함됩니다.</div><section class="card"><div class="toolbar"><label class="field"><span>연도</span><select id="history-year"><option value="">전체</option>${years.map((y) => `<option>${y}</option>`).join('')}</select></label><label class="field"><span>상태</span><select id="history-status"><option value="">전체</option><option value="APPROVED">최종승인</option><option value="PENDING">승인대기</option><option value="REJECTED">반려·취소</option></select></label><label class="field"><span>자료</span><select id="history-source"><option value="">전체</option><option value="APPLICATION">시스템 신청</option><option value="EXCEL">기존 Excel</option></select></label></div></section><div id="history-table"></div>`;
+  pageEl.innerHTML = `${pageTitle('나의 사용내역', '기존 Excel 자료와 시스템 신청자료를 함께 확인합니다.')}<div class="notice success"><strong>누적 최종승인 사용 ${fmt(me.total_used)}일 / ${fmtHours(me.total_used_hours)}시간</strong> · 기존 Excel 사용일수도 포함됩니다.</div><section class="card"><div class="toolbar"><label class="field"><span>연도</span><select id="history-year"><option value="">전체</option>${years.map((y) => `<option>${y}</option>`).join('')}</select></label><label class="field"><span>상태</span><select id="history-status"><option value="">전체</option><option value="APPROVED">최종승인</option><option value="PENDING">승인대기</option><option value="REJECTED">반려·취소</option></select></label><label class="field"><span>자료</span><select id="history-source"><option value="">전체</option><option value="APPLICATION">시스템 신청</option><option value="EXCEL">기존 Excel</option></select></label></div></section><div id="history-table"></div>`;
   const render = () => {
     const year = qs('#history-year').value, status = qs('#history-status').value, source = qs('#history-source').value;
     const filtered = rows.filter((r) => { if (year && !r.start_date.startsWith(year)) return false; const info = statusInfo(r)[0]; if (status === 'APPROVED' && info !== '최종승인') return false; if (status === 'PENDING' && !info.includes('대기')) return false; if (status === 'REJECTED' && !['반려', '취소'].includes(info)) return false; if (source === 'APPLICATION' && r.source !== 'APPLICATION') return false; if (source === 'EXCEL' && r.source === 'APPLICATION') return false; return true; });
-    qs('#history-table').innerHTML = `<section class="card"><div class="card-header"><h3>총 ${filtered.length}건</h3><span class="muted">선택조건 승인합계 ${fmt(filtered.filter((r) => statusInfo(r)[0] === '최종승인').reduce((s, r) => s + Number(r.days), 0))}일</span></div><div class="table-wrap desktop-table"><table class="data-table"><thead><tr><th>구분</th><th>기간/시간</th><th>일수</th><th>승인자</th><th>상태</th><th>사유</th><th>자료</th><th>처리</th></tr></thead><tbody>${filtered.map((r) => { const [label, color] = statusInfo(r); const cancellable = r.source === 'APPLICATION' && !['최종승인', '반려', '취소'].includes(label); return `<tr><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center">${requestPeriodLabel(r)}</td><td class="right strong">${fmt(r.days)}</td><td>1차 ${esc(r.approver1_name || '-')}<br>최종 ${esc(r.final_approver_name || '-')}</td><td class="center"><span class="badge ${color}">${label}</span>${r.reject_reason ? `<div class="negative small-text">${esc(r.reject_reason)}</div>` : ''}</td><td>${esc(r.reason || '-')}</td><td class="center">${r.source === 'APPLICATION' ? '시스템' : 'Excel'}</td><td class="center">${cancellable ? `<button class="btn red small cancel-request" data-id="${r.id}">취소</button>` : '-'}</td></tr>`; }).join('') || '<tr><td colspan="8" class="empty">내역이 없습니다.</td></tr>'}</tbody></table></div><div class="mobile-list">${filtered.map((r) => { const [label, color] = statusInfo(r); return `<article class="mobile-record"><div class="record-head"><strong>${esc(leaveTypeLabel(r.leave_type))}</strong><span class="badge ${color}">${label}</span></div><div>${requestPeriodLabel(r)} · <strong>${fmt(r.days)}일</strong></div><div class="muted small-text">${esc(r.reason || '-')}</div></article>`; }).join('')}</div></section>`;
+    qs('#history-table').innerHTML = `<section class="card"><div class="card-header"><h3>총 ${filtered.length}건</h3><span class="muted">선택조건 승인합계 ${fmt(filtered.filter((r) => statusInfo(r)[0] === '최종승인').reduce((s, r) => s + Number(r.days), 0))}일</span></div><div class="table-wrap desktop-table"><table class="data-table"><thead><tr><th>구분</th><th>기간/시간</th><th>일수/시간</th><th>승인자</th><th>상태</th><th>사유</th><th>자료</th><th>처리</th></tr></thead><tbody>${filtered.map((r) => { const [label, color] = statusInfo(r); const cancellable = r.source === 'APPLICATION' && !['최종승인', '반려', '취소'].includes(label); return `<tr><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center">${requestPeriodLabel(r)}</td><td class="right strong">${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</td><td>1차 ${esc(r.approver1_name || '-')}<br>최종 ${esc(r.final_approver_name || '-')}</td><td class="center"><span class="badge ${color}">${label}</span>${r.reject_reason ? `<div class="negative small-text">${esc(r.reject_reason)}</div>` : ''}</td><td>${esc(r.reason || '-')}</td><td class="center">${r.source === 'APPLICATION' ? '시스템' : 'Excel'}</td><td class="center">${cancellable ? `<button class="btn red small cancel-request" data-id="${r.id}">취소</button>` : '-'}</td></tr>`; }).join('') || '<tr><td colspan="8" class="empty">내역이 없습니다.</td></tr>'}</tbody></table></div><div class="mobile-list">${filtered.map((r) => { const [label, color] = statusInfo(r); return `<article class="mobile-record"><div class="record-head"><strong>${esc(leaveTypeLabel(r.leave_type))}</strong><span class="badge ${color}">${label}</span></div><div>${requestPeriodLabel(r)} · <strong>${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</strong></div><div class="muted small-text">${esc(r.reason || '-')}</div></article>`; }).join('')}</div></section>`;
     qsa('.cancel-request').forEach((button) => { button.onclick = async () => { if (!confirm('이 연차 신청을 취소하시겠습니까?')) return; try { await api(`/api/requests/${button.dataset.id}/cancel`, { method: 'POST' }); toast('신청이 취소되었습니다.'); historyPageV6(); } catch (e) { toast(e.message, 'error'); } }; });
   };
   ['#history-year', '#history-status', '#history-source'].forEach((sel) => qs(sel).onchange = render); render();
@@ -705,7 +726,7 @@ async function historyPageV6() {
 
 async function inboxPageV6() {
   const rows = await api('/api/inbox');
-  const cards = rows.map((r) => `<article class="approval-card"><div class="record-head"><span class="badge ${r.stage === 'FIRST' ? 'blue' : 'green'}">${r.stage === 'FIRST' ? '1차 승인' : '최종 승인'}</span><strong>${esc(r.applicant_name)}</strong></div><div class="approval-type">${esc(leaveTypeLabel(r.leave_type))} · ${fmt(r.days)}일</div><div>${requestPeriodLabel(r)}</div><div class="muted">${esc(r.reason || '-')}</div><div class="approval-actions"><button class="btn green approve" data-id="${r.id}">승인</button><button class="btn red reject" data-id="${r.id}">반려</button></div></article>`).join('');
+  const cards = rows.map((r) => `<article class="approval-card"><div class="record-head"><span class="badge ${r.stage === 'FIRST' ? 'blue' : 'green'}">${r.stage === 'FIRST' ? '1차 승인' : '최종 승인'}</span><strong>${esc(r.applicant_name)}</strong></div><div class="approval-type">${esc(leaveTypeLabel(r.leave_type))} · ${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</div><div>${requestPeriodLabel(r)}</div><div class="muted">${esc(r.reason || '-')}</div><div class="approval-actions"><button class="btn green approve" data-id="${r.id}">승인</button><button class="btn red reject" data-id="${r.id}">반려</button></div></article>`).join('');
   qs('#page').innerHTML = `${pageTitle('승인함', '휴대폰에서 바로 승인/반려할 수 있도록 신청별 카드로 표시합니다.')}<section class="card"><div class="card-header"><h3>처리 대기 ${rows.length}건</h3></div><div class="approval-grid">${cards || '<div class="empty">현재 처리할 신청이 없습니다.</div>'}</div></section>`;
   qsa('.approve').forEach((button) => { button.onclick = async () => { if (!confirm('이 신청을 승인하시겠습니까?')) return; try { await api(`/api/requests/${button.dataset.id}/action`, { method: 'POST', body: { action: 'approve' } }); toast('승인 처리되었습니다.'); inboxPageV6(); } catch (e) { toast(e.message, 'error'); } }; });
   qsa('.reject').forEach((button) => { button.onclick = () => { openModal('연차 신청 반려', '<label class="field"><span>반려 사유</span><textarea id="reject-reason" placeholder="반려 사유"></textarea></label>', '<button class="btn secondary modal-cancel">취소</button><button id="confirm-reject" class="btn red">반려 처리</button>'); qs('#confirm-reject', modal).onclick = async () => { try { await api(`/api/requests/${button.dataset.id}/action`, { method: 'POST', body: { action: 'reject', reason: qs('#reject-reason', modal).value } }); modal.close(); toast('반려 처리되었습니다.'); inboxPageV6(); } catch (e) { toast(e.message, 'error'); } }; }; });
@@ -756,7 +777,7 @@ async function adminRequestsV6(tabRequestId = adminTabRequestId) {
     if (!isCurrentAdminTab('requests', tabRequestId)) return;
     const requestTable = qs('#request-table');
     if (!requestTable) return;
-    requestTable.innerHTML = `<section class="card"><div class="card-header"><h3>조회 ${rows.length}건</h3><span class="muted">승인자·처리시간·사유까지 확인</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>회사</th><th>직원</th><th>구분</th><th>기간/시간</th><th>일수</th><th>상태</th><th>승인라인</th><th>현재단계</th><th>사유/반려</th><th>신청/처리일시</th></tr></thead><tbody>${shown.map((r) => { const [label,color]=statusInfo(r); return `<tr><td class="center">${esc(r.company_name)}</td><td><div class="name">${esc(r.applicant_name)}</div><div class="muted small-text">${esc(r.applicant_login)}</div></td><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center">${requestPeriodLabel(r)}</td><td class="right strong">${fmt(r.days)}</td><td class="center"><span class="badge ${color}">${label}</span></td><td>${approvalLineHtml(r, true)}</td><td>${r.current_approval ? `<strong>${esc(r.current_approval.role === 'REPRESENTATIVE' ? '최종' : `${r.current_approval.order}차`)}</strong><div class="muted small-text">${esc(r.current_approval.approver_name || '')}</div>` : '-'}</td><td>${esc(r.reason || '-')}${r.reject_reason ? `<div class="negative small-text">반려: ${esc(r.reject_reason)}</div>` : ''}</td><td class="small-text">신청 ${esc(r.created_at || '')}<br>수정 ${esc(r.updated_at || '')}</td></tr>`; }).join('') || '<tr><td colspan="10" class="empty">조회 결과가 없습니다.</td></tr>'}</tbody></table></div></section>`;
+    requestTable.innerHTML = `<section class="card"><div class="card-header"><h3>조회 ${rows.length}건</h3><span class="muted">승인자·처리시간·사유까지 확인</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>회사</th><th>직원</th><th>구분</th><th>기간/시간</th><th>일수/시간</th><th>상태</th><th>승인라인</th><th>현재단계</th><th>사유/반려</th><th>신청/처리일시</th></tr></thead><tbody>${shown.map((r) => { const [label,color]=statusInfo(r); return `<tr><td class="center">${esc(r.company_name)}</td><td><div class="name">${esc(r.applicant_name)}</div><div class="muted small-text">${esc(r.applicant_login)}</div></td><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center">${requestPeriodLabel(r)}</td><td class="right strong">${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</td><td class="center"><span class="badge ${color}">${label}</span></td><td>${approvalLineHtml(r, true)}</td><td>${r.current_approval ? `<strong>${esc(r.current_approval.role === 'REPRESENTATIVE' ? '최종' : `${r.current_approval.order}차`)}</strong><div class="muted small-text">${esc(r.current_approval.approver_name || '')}</div>` : '-'}</td><td>${esc(r.reason || '-')}${r.reject_reason ? `<div class="negative small-text">반려: ${esc(r.reject_reason)}</div>` : ''}</td><td class="small-text">신청 ${esc(r.created_at || '')}<br>수정 ${esc(r.updated_at || '')}</td></tr>`; }).join('') || '<tr><td colspan="10" class="empty">조회 결과가 없습니다.</td></tr>'}</tbody></table></div></section>`;
   };
   qs('#req-employment').onchange=load; qs('#req-company').onchange = () => { const cid=qs('#req-company').value; qsa('#req-user option').forEach((o) => { if (!o.value) return; o.hidden = cid && o.dataset.company !== cid; }); if (qs('#req-user').selectedOptions[0]?.hidden) qs('#req-user').value=''; load(); }; qs('#req-user').onchange=load; qs('#req-status').onchange=load; qs('#req-search').onclick=load; await load();
 }
@@ -768,7 +789,7 @@ async function adminUsageV6(tabRequestId = adminTabRequestId) {
   if (!adminContent) return;
   adminContent.innerHTML = `<section class="card"><div class="toolbar"><label class="field"><span>재직 구분</span><select id="usage-employment"><option value="all">전체</option><option value="current">재직자</option><option value="retired">퇴사일 등록자</option></select></label><label class="field"><span>회사</span><select id="usage-company">${companyOptions('', '전체 회사')}</select></label><label class="field"><span>직원</span><select id="usage-user"><option value="">전체 직원</option>${users.map((u)=>`<option value="${u.id}" data-company="${u.company_id}">${esc(u.employee_name)} (${esc(u.login_id)})</option>`).join('')}</select></label><label class="field"><span>시작일</span><input id="usage-from" type="date" value="${year}-01-01"></label><label class="field"><span>종료일</span><input id="usage-to" type="date" value="${today()}"></label><div class="actions"><button id="usage-search" class="btn">조회</button><button id="usage-export" class="btn outline">Excel 다운로드</button></div></div></section><div id="usage-result"></div>`;
   const params=()=>{const p=new URLSearchParams({status:'APPROVED',employment:qs('#usage-employment').value}); if(qs('#usage-company').value)p.set('company_id',qs('#usage-company').value); if(qs('#usage-user').value)p.set('user_id',qs('#usage-user').value); if(qs('#usage-from').value)p.set('from',qs('#usage-from').value); if(qs('#usage-to').value)p.set('to',qs('#usage-to').value); return p;};
-  let current=[]; const load=async()=>{current=await api(`/api/admin/requests?${params()}`); if (!isCurrentAdminTab('usage', tabRequestId)) return; const usageResult=qs('#usage-result'); if(!usageResult)return; const total=current.reduce((s,r)=>s+Number(r.days||0),0); usageResult.innerHTML=`<section class="card"><div class="card-header"><h3>최종승인 사용 ${current.length}건</h3><strong>합계 ${fmt(total)}일</strong></div><div class="table-wrap"><table class="data-table"><thead><tr><th>회사</th><th>직원</th><th>구분</th><th>기간/시간</th><th>일수</th><th>사유</th><th>자료구분</th></tr></thead><tbody>${current.map(r=>`<tr><td class="center">${esc(r.company_name)}</td><td>${esc(r.applicant_name)}</td><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center">${requestPeriodLabel(r)}</td><td class="right strong">${fmt(r.days)}</td><td>${esc(r.reason||'-')}</td><td class="center">${r.source==='APPLICATION'?'시스템':'Excel'}</td></tr>`).join('')||'<tr><td colspan="7" class="empty">조회 결과가 없습니다.</td></tr>'}</tbody></table></div></section>`;};
+  let current=[]; const load=async()=>{current=await api(`/api/admin/requests?${params()}`); if (!isCurrentAdminTab('usage', tabRequestId)) return; const usageResult=qs('#usage-result'); if(!usageResult)return; const total=current.reduce((s,r)=>s+Number(r.days||0),0); const totalHours=current.reduce((s,r)=>s+amountHours(r),0); usageResult.innerHTML=`<section class="card"><div class="card-header"><h3>최종승인 사용 ${current.length}건</h3><strong>합계 ${fmt(total)}일 / ${fmtHours(totalHours)}시간</strong></div><div class="table-wrap"><table class="data-table"><thead><tr><th>회사</th><th>직원</th><th>구분</th><th>기간/시간</th><th>일수/시간</th><th>사유</th><th>자료구분</th></tr></thead><tbody>${current.map(r=>`<tr><td class="center">${esc(r.company_name)}</td><td>${esc(r.applicant_name)}</td><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center">${requestPeriodLabel(r)}</td><td class="right strong">${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</td><td>${esc(r.reason||'-')}</td><td class="center">${r.source==='APPLICATION'?'시스템':'Excel'}</td></tr>`).join('')||'<tr><td colspan="7" class="empty">조회 결과가 없습니다.</td></tr>'}</tbody></table></div></section>`;};
   qs('#usage-employment').onchange=load; qs('#usage-company').onchange=()=>{const cid=qs('#usage-company').value;qsa('#usage-user option').forEach(o=>{if(o.value)o.hidden=cid&&o.dataset.company!==cid;});qs('#usage-user').value='';load();}; qs('#usage-user').onchange=load;qs('#usage-search').onclick=load;qs('#usage-export').onclick=()=>{const bytes=window.LeaveExport.buildUsageXlsx({rows:current,companyName:qs('#usage-company').selectedOptions[0].text,from:qs('#usage-from').value,to:qs('#usage-to').value});downloadBytes(bytes,`연차사용현황_${today()}.xlsx`,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');}; await load();
 }
 
@@ -803,7 +824,7 @@ async function adminStandardsV6(tabRequestId = adminTabRequestId) {
 }
 
 
-// ===== v8.0 DNM 전자결재 다단계 승인 UI + 안전한 페이지 전환 =====
+// ===== v8.1 DNM 전자결재 다단계 승인 UI + 시간단위 연차 =====
 function roleTypeV7(user) {
   if (user.is_admin) return 'ADMIN';
   if (user.is_representative) return 'REPRESENTATIVE';
@@ -853,7 +874,7 @@ async function renderShellV7() {
   navItems.push(['password', '●', '비밀번호 변경']);
   app.innerHTML = `
     <header class="app-header"><div class="header-inner">
-      <div class="brand"><div class="brand-mark">연</div><div><h1>디엔엠 연차관리</h1><small>(주)디엔엠 · v8.0 DNM</small></div></div>
+      <div class="brand"><div class="brand-mark">연</div><div><h1>디엔엠 연차관리</h1><small>(주)디엔엠 · v8.1 DNM Hourly</small></div></div>
       <div class="user-box"><div class="user-meta"><strong>${esc(me.employee_name)}</strong><span>${esc(me.company_name)} · ${esc(me.login_id)} · ${esc(me.role_label)}</span></div><button id="help-button" class="btn outline small">Help</button><button id="logout" class="btn outline small">로그아웃</button></div>
     </div></header>
     <div class="layout"><aside class="sidebar"><nav class="nav-card">${navItems.map(([key, icon, label]) => `<button class="nav-button" data-page="${key}"><span class="nav-icon">${icon}</span>${label}</button>`).join('')}</nav></aside><main class="content"><div id="page"></div></main></div>`;
@@ -903,11 +924,13 @@ async function applyPageV7(requestId = pageRequestId) {
   const pageEl = qs('#page');
   if (!pageEl) return;
   pageEl.innerHTML = `
-    ${pageTitle('연차 신청', '반차·하루·기간을 선택하고 전자결재 방식의 승인라인을 구성합니다.')}
+    ${pageTitle('연차 신청', '반차·하루·기간·시간단위 연차를 선택하고 전자결재 방식의 승인라인을 구성합니다.')}
     ${noApprover ? '<div class="notice danger"><strong>승인자가 등록되지 않았습니다.</strong> 관리자 → 사용자 관리에서 실제 사원에게 “연차 승인자”를 체크해 주세요.</div>' : ''}
     <section class="card mobile-apply"><form id="leave-form">
-      <label class="field"><span>신청 구분</span><div class="leave-type-pills"><label><input type="radio" name="leave-type-radio" value="FULL" checked><span>하루 / 기간</span></label><label><input type="radio" name="leave-type-radio" value="AM_HALF"><span>오전 반차</span></label><label><input type="radio" name="leave-type-radio" value="PM_HALF"><span>오후 반차</span></label></div></label>
-      <div class="grid cols-2 date-grid"><label class="field"><span>시작일</span><input id="start-date" type="date" min="${today()}" required></label><label class="field" id="end-field"><span>종료일</span><input id="end-date" type="date" min="${today()}" required></label></div>
+      <label class="field"><span>신청 구분</span><div class="leave-type-pills"><label><input type="radio" name="leave-type-radio" value="FULL" checked><span>하루 / 기간</span></label><label><input type="radio" name="leave-type-radio" value="AM_HALF"><span>오전 반차</span></label><label><input type="radio" name="leave-type-radio" value="PM_HALF"><span>오후 반차</span></label><label><input type="radio" name="leave-type-radio" value="HOURLY"><span>⏱ 시간단위</span></label></div></label>
+      <div class="grid cols-2 date-grid" id="date-fields"><label class="field"><span>시작일</span><input id="start-date" type="date" min="${today()}" required></label><label class="field" id="end-field"><span>종료일</span><input id="end-date" type="date" min="${today()}" required></label></div>
+      <div class="grid cols-2 date-grid" id="datetime-fields" style="display:none"><label class="field"><span>시작일시</span><input id="start-datetime" type="datetime-local" min="${today()}T00:00" step="1800"></label><label class="field"><span>종료일시</span><input id="end-datetime" type="datetime-local" min="${today()}T00:00" step="1800"></label></div>
+      <div class="notice" id="hourly-guide" style="display:none;margin-top:10px">시간단위 연차는 <strong>YYYY-MM-DD HH:MM ~ YYYY-MM-DD HH:MM</strong> 형식으로 신청하며, <strong>30분 단위</strong>만 가능합니다. 30분은 <strong>0.5시간</strong>으로 표시됩니다.</div>
       <div id="day-preview" class="calc-preview">날짜를 계산하는 중입니다.</div>
       <section class="approval-builder">
         <div class="card-header"><div><h3>승인라인</h3><div class="muted small-text">결재자 1명 이상을 추가하세요. 마지막 결재자가 최종 결정권자입니다.</div></div></div>
@@ -917,7 +940,7 @@ async function applyPageV7(requestId = pageRequestId) {
       <label class="field" style="margin-top:14px"><span>신청 사유</span><textarea id="leave-reason" placeholder="간단한 사유 또는 업무 인수인계 사항"></textarea></label>
       <button class="btn mobile-submit" type="submit" ${noApprover ? 'disabled' : ''}>승인 요청</button>
     </form></section>
-    <div class="notice warning"><strong>잔여 ${fmt(me.remaining)}일이어도 신청 가능합니다.</strong> 토·일요일, 국가공휴일·대체공휴일 및 추가휴일은 기간 일수에서 자동 제외됩니다.</div>`;
+    <div class="notice warning"><strong>잔여 ${fmt(me.remaining)}일 / ${fmtHours(me.remaining_hours)}시간이어도 신청 가능합니다.</strong> 토·일요일, 국가공휴일·대체공휴일 및 추가휴일은 기간 일수에서 자동 제외되며 시간단위 연차는 점심시간을 차감합니다.</div>`;
 
   const renderApprovalBuilder = () => {
     const reps = selectedApprovers.map((id) => approvers.first.find((a) => a.id === id)).filter(Boolean);
@@ -941,30 +964,49 @@ async function applyPageV7(requestId = pageRequestId) {
   };
   renderApprovalBuilder();
 
-  const start = qs('#start-date'), end = qs('#end-date'), preview = qs('#day-preview'); start.value = today(); end.value = today();
+  const start = qs('#start-date'), end = qs('#end-date'), startDateTime = qs('#start-datetime'), endDateTime = qs('#end-datetime'), preview = qs('#day-preview');
+  start.value = today(); end.value = today(); startDateTime.value = `${today()}T08:30`; endDateTime.value = `${today()}T09:00`;
   const selectedType = () => qs('input[name="leave-type-radio"]:checked').value;
+  const buildLeaveBody = () => {
+    const type = selectedType();
+    const body = { leave_type: type, start_date: start.value, end_date: end.value };
+    if (type === 'HOURLY') { body.start_datetime = startDateTime.value; body.end_datetime = endDateTime.value; }
+    return body;
+  };
   let calcTimer;
   const update = () => {
-    clearTimeout(calcTimer); const type = selectedType(); const half = type !== 'FULL'; qs('#end-field').style.display = half ? 'none' : ''; end.disabled = half; if (half) end.value = start.value;
+    clearTimeout(calcTimer);
+    const type = selectedType();
+    const hourly = type === 'HOURLY';
+    const half = type === 'AM_HALF' || type === 'PM_HALF';
+    qs('#date-fields').style.display = hourly ? 'none' : '';
+    qs('#datetime-fields').style.display = hourly ? '' : 'none';
+    qs('#hourly-guide').style.display = hourly ? '' : 'none';
+    start.disabled = hourly; end.disabled = hourly; start.required = !hourly; end.required = !hourly && !half;
+    startDateTime.disabled = !hourly; endDateTime.disabled = !hourly; startDateTime.required = hourly; endDateTime.required = hourly;
+    qs('#end-field').style.display = (!hourly && half) ? 'none' : '';
+    if (half && start.value) end.value = start.value;
     calcTimer = setTimeout(async () => {
-      if (!start.value || !end.value) return;
+      if ((!hourly && (!start.value || !end.value)) || (hourly && (!startDateTime.value || !endDateTime.value))) return;
       preview.innerHTML = '<span class="spinner mini"></span> 자동 계산 중';
       try {
-        const calc = await api('/api/calculate-leave', { method: 'POST', body: { leave_type: type, start_date: start.value, end_date: end.value } });
+        const calc = await api('/api/calculate-leave', { method: 'POST', body: buildLeaveBody() });
         const excluded = calc.excluded_dates?.length ? `<div class="excluded-list">제외: ${calc.excluded_dates.map((x) => `${esc(x.date)} ${esc(x.reason)}`).join(', ')}</div>` : '';
-        preview.innerHTML = `<strong>${fmt(calc.days)}일</strong> · ${esc(calc.start_time)} ~ ${esc(calc.end_time)}${excluded}`;
+        const amount = formatLeaveAmount(calc, { preferHours: type === 'HOURLY' });
+        const period = type === 'HOURLY' ? `${esc(dateTimeLabel(calc.start_datetime))} ~ ${esc(dateTimeLabel(calc.end_datetime))}` : `${esc(calc.start_time)} ~ ${esc(calc.end_time)}`;
+        preview.innerHTML = `<strong>${amount}</strong> · ${period}${excluded}`;
       } catch (e) { preview.innerHTML = `<span class="negative">${esc(e.message)}</span>`; }
     }, 180);
   };
-  qsa('input[name="leave-type-radio"]').forEach((el) => el.onchange = update); [start, end].forEach((el) => el.onchange = update); update();
+  qsa('input[name="leave-type-radio"]').forEach((el) => el.onchange = update); [start, end, startDateTime, endDateTime].forEach((el) => el.onchange = update); update();
 
   qs('#leave-form').onsubmit = async (event) => {
     event.preventDefault();
     if (!selectedApprovers.length) return toast('결재자를 1명 이상 추가해 주세요.', 'error');
     const submit = qs('button[type=submit]', event.currentTarget); submit.disabled = true;
     try {
-      const result = await api('/api/leave-requests', { method: 'POST', body: { leave_type: selectedType(), start_date: start.value, end_date: end.value, approver_ids: selectedApprovers, reason: qs('#leave-reason').value } });
-      toast(`${fmt(result.days)}일 연차가 신청되었습니다.`); await refreshMe(); goV7('history');
+      const result = await api('/api/leave-requests', { method: 'POST', body: { ...buildLeaveBody(), approver_ids: selectedApprovers, reason: qs('#leave-reason').value } });
+      toast(`${formatLeaveAmount(result, { preferHours: selectedType() === 'HOURLY' })} 연차가 신청되었습니다.`); await refreshMe(); goV7('history');
     } catch (error) { toast(error.message, 'error'); submit.disabled = false; }
   };
 }
@@ -977,7 +1019,7 @@ async function historyPageV7(requestId = pageRequestId) {
   const years = [...new Set(rows.map((r) => r.start_date?.slice(0, 4)).filter(Boolean))].sort().reverse();
   const pageEl = qs('#page');
   if (!pageEl) return;
-  pageEl.innerHTML = `${pageTitle('나의 사용내역', '신청별 승인 진행상태와 기존 Excel 사용자료를 함께 확인합니다.')}<div class="notice success"><strong>누적 최종승인 사용 ${fmt(me.total_used)}일</strong> · 기존 Excel 사용일수도 포함됩니다.</div><section class="card"><div class="toolbar"><label class="field"><span>연도</span><select id="history-year"><option value="">전체</option>${years.map((y) => `<option>${y}</option>`).join('')}</select></label><label class="field"><span>상태</span><select id="history-status"><option value="">전체</option><option value="APPROVED">최종승인</option><option value="PENDING">승인대기</option><option value="REJECTED">반려·취소</option></select></label></div></section><div id="history-table"></div>`;
+  pageEl.innerHTML = `${pageTitle('나의 사용내역', '신청별 승인 진행상태와 기존 Excel 사용자료를 함께 확인합니다.')}<div class="notice success"><strong>누적 최종승인 사용 ${fmt(me.total_used)}일 / ${fmtHours(me.total_used_hours)}시간</strong> · 기존 Excel 사용일수도 포함됩니다.</div><section class="card"><div class="toolbar"><label class="field"><span>연도</span><select id="history-year"><option value="">전체</option>${years.map((y) => `<option>${y}</option>`).join('')}</select></label><label class="field"><span>상태</span><select id="history-status"><option value="">전체</option><option value="APPROVED">최종승인</option><option value="PENDING">승인대기</option><option value="REJECTED">반려·취소</option></select></label></div></section><div id="history-table"></div>`;
   const render = () => {
     const year = qs('#history-year').value, filterStatus = qs('#history-status').value;
     const filtered = rows.filter((r) => {
@@ -988,10 +1030,10 @@ async function historyPageV7(requestId = pageRequestId) {
       if (filterStatus === 'REJECTED' && !['REJECTED', 'CANCELLED'].includes(state)) return false;
       return true;
     });
-    qs('#history-table').innerHTML = `<section class="card"><div class="card-header"><h3>총 ${filtered.length}건</h3></div><div class="table-wrap desktop-table"><table class="data-table"><thead><tr><th>구분</th><th>기간/시간</th><th>일수</th><th>승인라인</th><th>상태</th><th>사유</th><th>처리</th></tr></thead><tbody>${filtered.map((r) => {
+    qs('#history-table').innerHTML = `<section class="card"><div class="card-header"><h3>총 ${filtered.length}건</h3></div><div class="table-wrap desktop-table"><table class="data-table"><thead><tr><th>구분</th><th>기간/시간</th><th>일수/시간</th><th>승인라인</th><th>상태</th><th>사유</th><th>처리</th></tr></thead><tbody>${filtered.map((r) => {
       const [label, color] = statusInfo(r); const cancellable = r.source === 'APPLICATION' && !['APPROVED', 'REJECTED', 'CANCELLED'].includes(r.approval_state);
-      return `<tr><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center">${requestPeriodLabel(r)}</td><td class="right strong">${fmt(r.days)}</td><td>${approvalLineHtml(r, true)}</td><td class="center"><span class="badge ${color}">${esc(label)}</span>${r.reject_reason ? `<div class="negative small-text">${esc(r.reject_reason)}</div>` : ''}</td><td>${esc(r.reason || '-')}</td><td class="center">${cancellable ? `<button class="btn red small cancel-request" data-id="${r.id}">취소</button>` : '-'}</td></tr>`;
-    }).join('') || '<tr><td colspan="7" class="empty">내역이 없습니다.</td></tr>'}</tbody></table></div><div class="mobile-list">${filtered.map((r) => { const [label,color]=statusInfo(r); return `<article class="mobile-record"><div class="record-head"><strong>${esc(leaveTypeLabel(r.leave_type))}</strong><span class="badge ${color}">${esc(label)}</span></div><div>${requestPeriodLabel(r)} · <strong>${fmt(r.days)}일</strong></div>${approvalLineHtml(r,true)}<div class="muted small-text">${esc(r.reason||'-')}</div></article>`; }).join('')}</div></section>`;
+      return `<tr><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center">${requestPeriodLabel(r)}</td><td class="right strong">${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</td><td>${approvalLineHtml(r, true)}</td><td class="center"><span class="badge ${color}">${esc(label)}</span>${r.reject_reason ? `<div class="negative small-text">${esc(r.reject_reason)}</div>` : ''}</td><td>${esc(r.reason || '-')}</td><td class="center">${cancellable ? `<button class="btn red small cancel-request" data-id="${r.id}">취소</button>` : '-'}</td></tr>`;
+    }).join('') || '<tr><td colspan="7" class="empty">내역이 없습니다.</td></tr>'}</tbody></table></div><div class="mobile-list">${filtered.map((r) => { const [label,color]=statusInfo(r); return `<article class="mobile-record"><div class="record-head"><strong>${esc(leaveTypeLabel(r.leave_type))}</strong><span class="badge ${color}">${esc(label)}</span></div><div>${requestPeriodLabel(r)} · <strong>${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</strong></div>${approvalLineHtml(r,true)}<div class="muted small-text">${esc(r.reason||'-')}</div></article>`; }).join('')}</div></section>`;
     qsa('.cancel-request').forEach((button) => { button.onclick = async () => { if (!confirm('이 연차 신청을 취소하시겠습니까?')) return; try { await api(`/api/requests/${button.dataset.id}/cancel`, { method: 'POST' }); toast('신청이 취소되었습니다.'); historyPageV7(); } catch (e) { toast(e.message, 'error'); } }; });
   };
   qs('#history-year').onchange = render; qs('#history-status').onchange = render; render();
@@ -1003,7 +1045,7 @@ async function approvalPendingPageV7(requestId = pageRequestId) {
   const cards = rows.map((r) => {
     const isFinal = r.stage === 'REPRESENTATIVE';
     const label = isFinal ? '최종 결재' : `${r.stage_order}차 결재`;
-    return `<article class="approval-card"><div class="record-head"><span class="badge ${isFinal ? 'green' : 'blue'}">${label}</span><strong>${esc(r.applicant_name)}</strong></div><div class="approval-type">${esc(leaveTypeLabel(r.leave_type))} · ${fmt(r.days)}일</div><div>${requestPeriodLabel(r)}</div><div class="muted">${esc(r.reason || '-')}</div>${approvalLineHtml(r)}<div class="approval-actions"><button class="btn green approve" data-id="${r.id}">승인</button><button class="btn red reject" data-id="${r.id}">반려</button></div></article>`;
+    return `<article class="approval-card"><div class="record-head"><span class="badge ${isFinal ? 'green' : 'blue'}">${label}</span><strong>${esc(r.applicant_name)}</strong></div><div class="approval-type">${esc(leaveTypeLabel(r.leave_type))} · ${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</div><div>${requestPeriodLabel(r)}</div><div class="muted">${esc(r.reason || '-')}</div>${approvalLineHtml(r)}<div class="approval-actions"><button class="btn green approve" data-id="${r.id}">승인</button><button class="btn red reject" data-id="${r.id}">반려</button></div></article>`;
   }).join('');
   const pageEl = qs('#page');
   if (!pageEl) return;
@@ -1017,7 +1059,7 @@ async function approvalHistoryPageV7(requestId = pageRequestId) {
   if (!isCurrentPage('approvalHistory', requestId)) return;
   const pageEl = qs('#page');
   if (!pageEl) return;
-  pageEl.innerHTML = `${pageTitle('나의 결재 처리내역', '본인이 직접 승인 또는 반려한 내역을 확인합니다.')}<section class="card"><div class="card-header"><h3>처리내역 ${rows.length}건</h3></div><div class="table-wrap desktop-table"><table class="data-table"><thead><tr><th>처리일시</th><th>신청자</th><th>구분</th><th>기간</th><th>일수</th><th>내 처리</th><th>전체 승인라인</th><th>사유</th></tr></thead><tbody>${rows.map((r) => `<tr><td class="center">${esc(r.my_action_at || '-')}</td><td>${esc(r.applicant_name)}</td><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center">${requestPeriodLabel(r)}</td><td class="right strong">${fmt(r.days)}</td><td class="center"><span class="badge ${r.my_action === 'APPROVED' ? 'green' : 'red'}">${r.my_action === 'APPROVED' ? '승인' : '반려'}</span>${r.my_comment ? `<div class="negative small-text">${esc(r.my_comment)}</div>` : ''}</td><td>${approvalLineHtml(r,true)}</td><td>${esc(r.reason || '-')}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">처리한 승인내역이 없습니다.</td></tr>'}</tbody></table></div><div class="mobile-list">${rows.map((r)=>`<article class="mobile-record"><div class="record-head"><strong>${esc(r.applicant_name)}</strong><span class="badge ${r.my_action==='APPROVED'?'green':'red'}">${r.my_action==='APPROVED'?'승인':'반려'}</span></div><div>${requestPeriodLabel(r)} · ${fmt(r.days)}일</div><div class="muted small-text">${esc(r.my_action_at||'')}</div>${approvalLineHtml(r,true)}</article>`).join('')}</div></section>`;
+  pageEl.innerHTML = `${pageTitle('나의 결재 처리내역', '본인이 직접 승인 또는 반려한 내역을 확인합니다.')}<section class="card"><div class="card-header"><h3>처리내역 ${rows.length}건</h3></div><div class="table-wrap desktop-table"><table class="data-table"><thead><tr><th>처리일시</th><th>신청자</th><th>구분</th><th>기간</th><th>일수/시간</th><th>내 처리</th><th>전체 승인라인</th><th>사유</th></tr></thead><tbody>${rows.map((r) => `<tr><td class="center">${esc(r.my_action_at || '-')}</td><td>${esc(r.applicant_name)}</td><td class="center">${esc(leaveTypeLabel(r.leave_type))}</td><td class="center">${requestPeriodLabel(r)}</td><td class="right strong">${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</td><td class="center"><span class="badge ${r.my_action === 'APPROVED' ? 'green' : 'red'}">${r.my_action === 'APPROVED' ? '승인' : '반려'}</span>${r.my_comment ? `<div class="negative small-text">${esc(r.my_comment)}</div>` : ''}</td><td>${approvalLineHtml(r,true)}</td><td>${esc(r.reason || '-')}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">처리한 승인내역이 없습니다.</td></tr>'}</tbody></table></div><div class="mobile-list">${rows.map((r)=>`<article class="mobile-record"><div class="record-head"><strong>${esc(r.applicant_name)}</strong><span class="badge ${r.my_action==='APPROVED'?'green':'red'}">${r.my_action==='APPROVED'?'승인':'반려'}</span></div><div>${requestPeriodLabel(r)} · ${formatLeaveAmount(r, { preferHours: r.leave_type === 'HOURLY' })}</div><div class="muted small-text">${esc(r.my_action_at||'')}</div>${approvalLineHtml(r,true)}</article>`).join('')}</div></section>`;
 }
 
 
