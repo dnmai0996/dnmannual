@@ -1,0 +1,2 @@
+// Parser interface fixture. Production XLSX bytes are decoded by ExcelJS.
+export default {Workbook:class {constructor(){this.worksheets=[];this.xlsx={load:async buffer=>{const d=JSON.parse(Buffer.from(buffer).toString());this.worksheets=d.sheets.map(({name,rows})=>({name,columnCount:Math.max(...rows.map(r=>r.length)),eachRow(options,fn){rows.forEach((r,i)=>fn({cellCount:r.length,getCell(n){return {value:r[n-1]??''};}},i+1));}}));}};}getWorksheet(name){return this.worksheets.find(s=>s.name===name);}}};

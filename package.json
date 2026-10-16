@@ -1,6 +1,6 @@
 {
   "name": "dnm-annual-leave-netlify",
-  "version": "8.1.0-dnm-hourly",
+  "version": "8.2.0-dnm",
   "private": true,
   "type": "module",
   "engines": {
@@ -12,7 +12,8 @@
     "exceljs": "4.4.0"
   },
   "scripts": {
-    "check": "node --check public/app.js && node --check netlify/functions/api.mjs",
-    "test": "node scripts/smoke-test.mjs"
+    "check": "node scripts/check.mjs",
+    "test": "node scripts/smoke-test.mjs && node --no-warnings --experimental-loader ./scripts/test-support/loader.mjs scripts/test-v82.mjs",
+    "dev:review": "node --no-warnings --experimental-loader ./scripts/test-support/loader.mjs scripts/dev-test-server.mjs"
   }
 }

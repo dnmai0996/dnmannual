@@ -2,6 +2,9 @@ import { getStore } from '@netlify/blobs';
 import Holidays from 'date-holidays';
 import ExcelJS from 'exceljs';
 import { INITIAL_STATE } from './_lib/initial-state.js';
+import { ROSTER_2026 } from './_lib/roster-2026.js';
+import { DAY_MINUTES, parts, minutesFromParts, normalizeCharge, requestMinutesInRange, sumRequests, sumAdjustments, cycleBalance, cycleHistory, basisDate } from './_lib/balance.js';
+import { ROSTER_FIELDS, parseRosterWorkbook, matchEmployee, importChanges, auditStaff } from './_lib/roster.js';
 import {
   parseIso, todayIsoKst, addDays, cumulativeGranted, currentEntitlement, serviceCycle,
   anniversaryInYear, priorCycleForAnniversary, tenureLabel, countBusinessDays,
@@ -12,8 +15,8 @@ const SESSION_SECONDS = 10 * 60 * 60;
 const DEFAULT_HASH = 'pbkdf2$100000$7a8e927109f2b5d4c8a18fd3418f9352$fcfbf0d30d90aefca3e450e6bee44a9e50b9e5f364e105d80db5b69b98d3a5ac';
 const ADMIN_HASH_0996 = 'pbkdf2$100000$4d47c197f9d5488c9daaa3960e20b273$4e3110edeabe1590d55a8ef78dea96877c6225d0f1e7c206e207f80a66cf20d5';
 const DEFAULT_WORK = { work_start: '08:30', lunch_start: '12:30', lunch_end: '13:30', work_end: '17:30' };
-const SCHEMA_VERSION = 9;
-const APP_VERSION = '8.1-dnm-hourly';
+const SCHEMA_VERSION = 10;
+const APP_VERSION = '8.2.0-dnm';
 const SYSTEM_ADMIN_LOGIN = 'admin';
 const REPRESENTATIVE_LOGIN = '대표이사';
 const RESERVED_LOGINS = new Set(['admin', '통합관리자', '관리자', '대표이사', '대표자']);
@@ -104,57 +107,21 @@ function userAvailable(u, asOf = todayIsoKst()) { return Boolean(u && !u.deleted
 function approvalStatusLabel(status) {
   return ({ PENDING: '승인대기', WAITING: '순서대기', APPROVED: '승인', REJECTED: '반려', CANCELLED: '취소' })[status] || status || '';
 }
-function ensureSystemAccounts(s, t = nowIso()) {
-  s.counters = s.counters || {};
-  const nextId = () => {
-    const n = Number(s.counters.user || Math.max(0, ...s.users.map((x) => Number(x.id) || 0)) + 1);
-    s.counters.user = n + 1;
-    return n;
-  };
-  let admin = s.users.find((u) => u.is_system_account && u.is_admin && !u.legacy_hidden)
-    || s.users.find((u) => ['admin', '통합관리자', '관리자'].includes(u.login_id));
-  if (!admin) {
-    admin = { id: nextId(), company_id: null, employee_code: '', employee_name: '관리자', login_id: SYSTEM_ADMIN_LOGIN,
-      password_hash: ADMIN_HASH_0996, department: '', position: '시스템관리자', join_date: todayIsoKst(), is_admin: true,
-      is_representative: false, can_approve_first: false, can_approve_final: false, is_system_account: true, active: true,
-      must_change_password: true, retire_date: '', deleted: false, source_accrued: null, source_used: null, source_remaining: null,
-      created_at: t, updated_at: t };
-    s.users.push(admin);
+function ensureSystemAccounts(s,t=nowIso()) {
+  s.counters ||= {};
+  let admin=s.users.find(u=>u.is_system_account&&u.login_id===SYSTEM_ADMIN_LOGIN&&!u.deleted);
+  if(!admin) {
+    const id=Math.max(Number(s.counters.user||1),...s.users.map(x=>Number(x.id)+1));s.counters.user=id+1;
+    admin={id,company_id:null,employee_name:'관리자',employee_code:'',login_id:SYSTEM_ADMIN_LOGIN,password_hash:ADMIN_HASH_0996,is_system_account:true,is_admin:true,is_representative:false,active:true,deleted:false,legacy_hidden:false,must_change_password:true,join_date:todayIsoKst(),created_at:t,updated_at:t};s.users.push(admin);
   }
-  let rep = s.users.find((u) => u.is_representative && !u.legacy_hidden)
-    || s.users.find((u) => ['대표이사', '대표자'].includes(u.login_id) && u.is_system_account && !u.legacy_hidden);
-  if (!rep) {
-    rep = { id: nextId(), company_id: null, employee_code: '', employee_name: '대표이사', login_id: REPRESENTATIVE_LOGIN,
-      password_hash: DEFAULT_HASH, department: '대표', position: '대표이사', join_date: todayIsoKst(), is_admin: false,
-      is_representative: true, can_approve_first: false, can_approve_final: true, is_system_account: true, active: true,
-      must_change_password: true, retire_date: '', deleted: false, source_accrued: null, source_used: null, source_remaining: null,
-      created_at: t, updated_at: t };
-    s.users.push(rep);
-  }
-  // 기존 v3~v7의 회사별 시스템 승인자/대표 계정은 기록 보존을 위해 숨김 처리합니다.
-  for (const u of s.users) {
-    if (u.id === admin.id || u.id === rep.id) continue;
-    if (u.is_system_account) {
-      u.legacy_hidden = true; u.active = false; u.can_approve_first = false; u.can_approve_final = false; u.is_admin = false; u.is_representative = false;
-      if (!String(u.login_id || '').startsWith('__legacy__')) {
-        u.original_login_id = u.original_login_id || u.login_id || '';
-        u.login_id = `__legacy__${u.id}__${u.original_login_id || 'system'}`;
-      }
-    } else {
-      // 일반 직원에게도 대표이사/관리자 권한을 부여할 수 있도록 is_admin은 보존합니다.
-      u.is_representative = false; u.can_approve_final = false; u.is_system_account = false;
-    }
-  }
-  Object.assign(admin, { company_id: null, employee_name: '관리자', login_id: SYSTEM_ADMIN_LOGIN, department: '', position: '시스템관리자',
-    is_admin: true, is_representative: false, can_approve_first: false, can_approve_final: false, is_system_account: true,
-    legacy_hidden: false, deleted: false, active: true, retire_date: '' });
-  if (!parseIso(admin.join_date)) admin.join_date = todayIsoKst();
-  if (admin.must_change_password || !admin.password_hash) { admin.password_hash = ADMIN_HASH_0996; admin.must_change_password = false; }
-  Object.assign(rep, { company_id: null, employee_name: '대표이사', login_id: REPRESENTATIVE_LOGIN, department: '대표', position: '대표이사',
-    is_admin: true, is_representative: true, can_approve_first: true, can_approve_final: true, is_system_account: true,
-    legacy_hidden: false, deleted: false, active: true, retire_date: '' });
-  if (!parseIso(rep.join_date)) rep.join_date = todayIsoKst();
-  return { admin, representative: rep };
+  admin.is_admin=true;
+  if(!admin.password_hash){admin.password_hash=ADMIN_HASH_0996;admin.must_change_password=true;}
+  // Preserve employee IDs, credentials, privileges, and actual CEO employee identity.
+  // Never turn a real employee into a synthetic representative account.
+  const representative=s.users.find(u=>!u.deleted&&!u.legacy_hidden&&!u.is_system_account&&u.is_representative)
+    ||s.users.find(u=>!u.deleted&&!u.legacy_hidden&&u.is_representative)||null;
+  if(representative)representative.is_admin=true;
+  return {admin,representative};
 }
 function ensureRepresentativeAccount(s, t = nowIso()) { return ensureSystemAccounts(s, t).representative; }
 function normalizeRequestApproval(s, r, representativeId) {
@@ -169,10 +136,9 @@ function normalizeRequestApproval(s, r, representativeId) {
       const status = r.status1 === 'APPROVED' ? 'APPROVED' : r.status1 === 'REJECTED' ? 'REJECTED' : r.status1 === 'CANCELLED' ? 'CANCELLED' : 'PENDING';
       steps.push({ order: 1, approver_id: Number(r.approver1_id), role: 'APPROVER', status, action_at: status === 'PENDING' ? null : (r.approved1_at || r.updated_at || null), comment: status === 'REJECTED' ? (r.reject_reason || '') : '' });
     }
-    // 미처리 신청의 최종 승인자는 전용 로그인 ID '대표이사'로 통일합니다.
-    // 이미 최종 승인/반려가 끝난 과거 자료만 당시 최종 승인자를 보존합니다.
+    // 과거 자료의 지정된 최종 결재자를 보존합니다. 최종자 정보 자체가 없을 때만 대표자에게 연결합니다.
     const finalDone = ['APPROVED', 'REJECTED'].includes(r.status_final);
-    const finalId = Number((finalDone ? r.final_approver_id : representativeId) || representativeId || r.final_approver_id || 0) || null;
+    const finalId = Number(r.final_approver_id || representativeId || 0) || null;
     if (finalId) {
       let status = r.status_final === 'APPROVED' ? 'APPROVED' : r.status_final === 'REJECTED' ? 'REJECTED' : r.status_final === 'CANCELLED' ? 'CANCELLED' : 'WAITING';
       if (r.status1 === 'APPROVED' && status === 'WAITING') status = 'PENDING';
@@ -208,7 +174,7 @@ function syncLegacyApprovalFields(r) {
     else { r.status1 = 'REJECTED'; r.status_final = 'WAITING'; }
     r.reject_reason = rejected.comment || r.reject_reason || '';
   } else {
-    const firstApproved = firstSteps.length > 0 && firstSteps.every((x) => x.status === 'APPROVED');
+    const firstApproved = firstSteps.every((x) => x.status === 'APPROVED');
     r.status1 = firstApproved ? 'APPROVED' : 'PENDING';
     r.status_final = repStep?.status === 'APPROVED' ? 'APPROVED' : repStep?.status === 'REJECTED' ? 'REJECTED' : 'WAITING';
     r.approval_state = firstApproved && repStep?.status === 'APPROVED' ? 'APPROVED' : 'PENDING';
@@ -221,6 +187,7 @@ function syncLegacyApprovalFields(r) {
 }
 function currentApprovalStep(r) {
   if (r.source !== 'APPLICATION' || !Array.isArray(r.approval_steps)) return null;
+  if (['APPROVED','REJECTED','CANCELLED'].includes(r.approval_state)) return null;
   return r.approval_steps.find((x) => x.status === 'PENDING') || null;
 }
 function approvalStateOf(r) {
@@ -254,6 +221,22 @@ function ensureStateShape(s) {
     if (u.legacy_hidden == null) u.legacy_hidden = false;
     if (!u.is_system_account && isRetiredAsOf(u)) u.active = false;
   }
+  s.staff_audit ||= []; s.cycle_grants ||= [];
+  s.roster_history ||= structuredClone(ROSTER_2026.history);
+  s.roster_source ||= {source_file:ROSTER_2026.source_file,source_as_of_text:ROSTER_2026.source_as_of_text,counts:ROSTER_2026.counts};
+  for(const u of s.users){
+    if(!u.is_system_account){
+      u.leave_basis_date ||= u.join_date;
+      const rec=ROSTER_2026.current.find(r=>r.employee_name.replace(/\s/g,'')===String(u.employee_name).replace(/\s/g,''));
+      if(rec){
+        u.roster_source_record ||= structuredClone(rec);
+        for(const field of ['address','career','gender','age_source','employment_note','review_notes'])if(u[field]==null)u[field]=rec[field];
+        if(!s.dnm82_migrated && rec.department==='대표이사'){u.is_representative=true;u.is_admin=true;}
+      }
+    }
+  }
+  s.dnm82_migrated=true;
+  for(const a of s.adjustments){if(!Number.isFinite(a.minutes))a.minutes=Math.round(Number(a.amount||0)*DAY_MINUTES);a.amount=a.minutes/DAY_MINUTES;}
   const { representative } = ensureSystemAccounts(s, t);
   for (const c of s.companies) {
     if (!s.work_settings.some((w) => Number(w.company_id) === Number(c.id))) s.work_settings.push({ company_id: c.id, ...DEFAULT_WORK, updated_at: t });
@@ -264,7 +247,8 @@ function ensureStateShape(s) {
     if (r.end_time == null) r.end_time = '';
     if (r.start_datetime == null) r.start_datetime = r.start_date && r.start_time ? `${r.start_date}T${r.start_time}` : '';
     if (r.end_datetime == null) r.end_datetime = r.end_date && r.end_time ? `${r.end_date}T${r.end_time}` : '';
-    if (r.hours == null || !Number.isFinite(Number(r.hours))) r.hours = requestHoursFromDays(s, r.user_id, r.days);
+    if (r.hours == null || !Number.isFinite(Number(r.hours))) r.hours = Number(r.days || 0)*8;
+    normalizeCharge(r);
     if (r.leave_type !== 'HOURLY' && !Array.isArray(r.hourly_segments)) r.hourly_segments = null;
     normalizeRequestApproval(s, r, representative?.id || null);
     const current = currentApprovalStep(r);
@@ -281,7 +265,7 @@ async function initDb(env) {
   if (!existing) {
     const initial = ensureStateShape(structuredClone(INITIAL_STATE));
     initial.updated_at = nowIso();
-    await env.stateStore.setJSON('state', initial, { onlyIfNew: true, metadata: { schema: 'leave-manager-v8.1-hourly' } });
+    await env.stateStore.setJSON('state', initial, { onlyIfNew: true, metadata: { schema: 'leave-manager-v8.2' } });
   }
 }
 async function loadState(env) {
@@ -292,7 +276,7 @@ async function loadState(env) {
 async function saveState(env, version, state) {
   ensureStateShape(state);
   state.updated_at = nowIso();
-  const r = await env.stateStore.setJSON('state', state, { onlyIfMatch: version, metadata: { schema: 'leave-manager-v7.1', updated_at: state.updated_at } });
+  const r = await env.stateStore.setJSON('state', state, { onlyIfMatch: version, metadata: { schema: 'leave-manager-v8.2', updated_at: state.updated_at } });
   if (!r?.modified) throw new HttpError(409, '다른 사용자가 동시에 자료를 처리했습니다. 화면을 새로고침한 뒤 다시 시도해 주세요.');
 }
 async function createSession(env, token, userId, expiresAt) { await env.sessionStore.setJSON(token, { user_id: Number(userId), expires_at: Number(expiresAt) }, { metadata: { expires_at: Number(expiresAt) } }); }
@@ -313,29 +297,12 @@ function userByLogin(s, login) {
 function companyName(s, id) { return companyById(s, id)?.name || '전체 회사'; }
 function getWorkSettings(s, companyId) { return s.work_settings.find((w) => Number(w.company_id) === Number(companyId)) || { company_id: Number(companyId), ...DEFAULT_WORK }; }
 
-function requestDaysInRange(request, a, b) {
-  if (!a || !b) return Number(request.days || 0);
-  if (!request.start_date || !request.end_date || request.end_date < a || request.start_date > b) return 0;
-  if (request.leave_type === 'IMPORTED_SUMMARY') return request.start_date >= a && request.start_date <= b ? Number(request.days || 0) : 0;
-  if (['AM_HALF', 'PM_HALF', 'IMPORTED_HALF', 'HALF_IMPORTED'].includes(request.leave_type)) return request.start_date >= a && request.start_date <= b ? Number(request.days || 0.5) : 0;
-  if (Array.isArray(request.charge_dates) && request.charge_dates.length) return request.charge_dates.filter((d) => d >= a && d <= b).length;
-  const start = request.start_date > a ? request.start_date : a; const end = request.end_date < b ? request.end_date : b;
-  if (request.start_date === request.end_date) return Number(request.days || 0);
-  return countBusinessDays(start, end);
-}
-function approvedUsedDays(s, userId, a = null, b = null) { return roundLeaveDays(s.requests.filter((r) => r.user_id === Number(userId) && r.status1 === 'APPROVED' && r.status_final === 'APPROVED').reduce((sum, r) => sum + requestDaysInRange(r, a, b), 0)); }
-function pendingDays(s, userId, exclude = null, a = null, b = null) { return roundLeaveDays(s.requests.filter((r) => r.user_id === Number(userId) && r.id !== Number(exclude) && r.source === 'APPLICATION' && (r.status1 === 'PENDING' || (r.status1 === 'APPROVED' && r.status_final === 'WAITING'))).reduce((sum, r) => sum + requestDaysInRange(r, a, b), 0)); }
+function requestDaysInRange(request,a,b){return requestMinutesInRange(request,a,b)/DAY_MINUTES;}
+function approvedUsedDays(s,userId,a=null,b=null){return sumRequests(s,userId,'APPROVED',a,b)/DAY_MINUTES;}
+function pendingDays(s,userId,exclude=null,a=null,b=null){return sumRequests(s,userId,'PENDING',a,b,exclude)/DAY_MINUTES;}
 function adjustmentEffectiveDate(a) { return cleanText(a.effective_date || String(a.created_at || '').slice(0, 10), 10); }
-function adjustmentTotal(s, userId, a = null, b = null) { return roundLeaveDays(s.adjustments.filter((x) => x.user_id === Number(userId) && (!a || !b || (adjustmentEffectiveDate(x) >= a && adjustmentEffectiveDate(x) <= b))).reduce((sum, x) => sum + Number(x.amount || 0), 0)); }
-function currentCycleBalance(s, user, asOf = todayIsoKst()) {
-  const calcAsOf = isRetiredAsOf(user, asOf) ? user.retire_date : asOf;
-  const cycle = serviceCycle(user.join_date, calcAsOf); if (!cycle) return null;
-  const used = approvedUsedDays(s, user.id, cycle.cycle_start, cycle.cycle_end);
-  const pending = pendingDays(s, user.id, null, cycle.cycle_start, cycle.cycle_end);
-  const adjustments = adjustmentTotal(s, user.id, cycle.cycle_start, cycle.cycle_end);
-  const remaining = roundLeaveDays(Number(cycle.granted || 0) + adjustments - used);
-  return { ...cycle, used, pending, adjustments, remaining, projected_remaining: roundLeaveDays(remaining - pending) };
-}
+function adjustmentTotal(s,userId,a=null,b=null){return sumAdjustments(s,userId,a,b)/DAY_MINUTES;}
+function currentCycleBalance(s,user,asOf=todayIsoKst()){return cycleBalance(s,user,asOf);}
 function roleLabel(u) {
   if (u.is_admin && u.is_representative) return '대표이사/관리자';
   if (u.is_admin) return '관리자';
@@ -348,9 +315,9 @@ function userSummary(s, u, asOf = todayIsoKst()) {
   const system = Boolean(u.is_system_account), retired = !system && hasRetireDate(u), calcAsOf = retired && isRetiredAsOf(u, asOf) ? u.retire_date : asOf;
   const cycle = system ? null : currentCycleBalance(s, u, calcAsOf);
   const settings = system ? DEFAULT_WORK : getWorkSettings(s, u.company_id);
-  const workHoursPerDay = roundHours(workMinutesPerDay(settings) / 60);
-  const toHours = (days) => roundHours(Number(days || 0) * workHoursPerDay);
-  const granted = system ? 0 : Number(cycle?.granted || 0), current = system ? 0 : currentEntitlement(u.join_date, calcAsOf), used = system ? 0 : Number(cycle?.used || 0), pending = system ? 0 : Number(cycle?.pending || 0), adjustments = system ? 0 : Number(cycle?.adjustments || 0), remaining = system ? 0 : Number(cycle?.remaining || 0), projected = system ? 0 : Number(cycle?.projected_remaining || 0);
+  const workHoursPerDay = 8;
+  const toHours = (days) => Number(days || 0) * workHoursPerDay;
+  const granted = system ? 0 : Number(cycle?.granted || 0), current = system ? 0 : currentEntitlement(basisDate(u), calcAsOf), used = system ? 0 : Number(cycle?.used || 0), pending = system ? 0 : Number(cycle?.pending || 0), adjustments = system ? 0 : Number(cycle?.adjustments || 0), remaining = system ? 0 : Number(cycle?.remaining || 0), projected = system ? 0 : Number(cycle?.projected_remaining || 0);
   const totalUsed = system ? 0 : approvedUsedDays(s, u.id);
   const employmentStatus = system ? '시스템' : (!hasRetireDate(u) ? '재직' : (isRetiredAsOf(u, asOf) ? '퇴사' : '퇴사예정'));
   return {
@@ -361,17 +328,19 @@ function userSummary(s, u, asOf = todayIsoKst()) {
     can_approve_first: Boolean(u.can_approve_first), can_approve_final: Boolean(u.can_approve_final), is_system_account: system, active: Boolean(u.active && !u.deleted && !isRetiredAsOf(u, asOf)),
     must_change_password: Boolean(u.must_change_password), source_accrued: u.source_accrued, source_used: u.source_used, source_remaining: u.source_remaining,
     role_label: roleLabel(u), tenure: system ? '-' : tenureLabel(u.join_date, calcAsOf), current_entitlement: current,
-    cumulative_granted: system ? 0 : cumulativeGranted(u.join_date, calcAsOf), total_used: totalUsed, total_adjustments: system ? 0 : adjustmentTotal(s, u.id),
+    cumulative_granted: system ? 0 : cumulativeGranted(basisDate(u), calcAsOf), total_used: totalUsed, total_adjustments: system ? 0 : adjustmentTotal(s, u.id),
     service_year: system ? null : cycle?.service_year, cycle_start: system ? '' : cycle?.cycle_start, cycle_end: system ? '' : cycle?.cycle_end,
     next_anniversary: system || retired ? '' : cycle?.next_anniversary, next_entitlement: system || retired ? 0 : cycle?.next_entitlement,
     work_hours_per_day: workHoursPerDay, granted_hours: toHours(granted), used_hours: toHours(used), pending_hours: toHours(pending), adjustments_hours: toHours(adjustments), remaining_hours: toHours(remaining), projected_remaining_hours: toHours(projected), total_used_hours: toHours(totalUsed),
+    leave_basis_date: basisDate(u), amounts: {granted:parts(granted*DAY_MINUTES),used:parts(used*DAY_MINUTES),pending:parts(pending*DAY_MINUTES),adjustments:parts(adjustments*DAY_MINUTES),remaining:parts(remaining*DAY_MINUTES),projected_remaining:parts(projected*DAY_MINUTES),total_used:parts(totalUsed*DAY_MINUTES)}, carryover_minutes:0,
     granted, used, pending, adjustments, remaining, available: projected, projected_remaining: projected, over_request_allowed: true, as_of: asOf
   };
 }
 function requestRow(s, r) {
+  normalizeCharge(r);
   const a = userById(s, r.user_id), f = userById(s, r.approver1_id), z = userById(s, r.final_approver_id);
-  const workHoursPerDay = roundHours(workMinutesPerDay(getWorkSettings(s, a?.company_id)) / 60);
-  const hours = Number.isFinite(Number(r.hours)) ? roundHours(r.hours) : requestHoursFromDays(s, r.user_id, r.days);
+  const workHoursPerDay = 8;
+  const hours = r.minutes / 60;
   const approvalLine = Array.isArray(r.approval_steps) ? r.approval_steps.map((step) => {
     const u = userById(s, step.approver_id);
     return {
@@ -384,7 +353,7 @@ function requestRow(s, r) {
       role_label: step.role === 'REPRESENTATIVE' ? '최종 결재' : `${step.order}차 결재`
     };
   }) : [];
-  const current = approvalLine.find((step) => step.status === 'PENDING') || null;
+  const current = ['APPROVED','CANCELLED','REJECTED'].includes(approvalStateOf(r)) ? null : (approvalLine.find((step) => step.status === 'PENDING') || null);
   const approvedCount = approvalLine.filter((step) => step.status === 'APPROVED').length;
   const state = approvalStateOf(r);
   let statusLabel = '승인대기';
@@ -461,10 +430,11 @@ function timeSegmentsOverlap(a, b) {
 function hasLeaveConflict(s, userId, type, start, end, calc = null) {
   const existing = s.requests.filter((r) => r.user_id === Number(userId) && !['REJECTED', 'CANCELLED'].includes(r.status1) && !['REJECTED', 'CANCELLED'].includes(r.status_final) && r.leave_type !== 'IMPORTED_SUMMARY' && r.start_date <= end && r.end_date >= start);
   if (!existing.length) return null;
-  if (type === 'FULL') return existing[0];
+  // FULL still compares actual charge dates; a weekend in a date range is not a conflict.
+
   const candidate = calc?.hourly_segments?.length
     ? calc.hourly_segments.map((x) => ({ date: x.date, start_time: x.start_time, end_time: x.end_time, full: false }))
-    : requestSegments(s, { user_id: Number(userId), leave_type: type, start_date: start, end_date: end, start_time: calc?.start_time || '', end_time: calc?.end_time || '', charge_dates: calc?.charge_dates || null });
+    : requestSegments(s, { user_id: Number(userId), leave_type: type, start_date: start, end_date: end, import_key:importKey, start_time: calc?.start_time || cleanText(pick(row,['시작시간']),5), end_time: calc?.end_time || cleanText(pick(row,['종료시간']),5), charge_dates: calc?.charge_dates || null });
   for (const r of existing) {
     const segments = requestSegments(s, r);
     if (segments.some((x) => candidate.some((y) => timeSegmentsOverlap(x, y)))) return r;
@@ -525,11 +495,16 @@ function workingDateDetails(s, companyId, start, end) {
   }
   return { charge_dates: chargeDates, excluded_dates: excluded, holidays };
 }
+function validateDnmWork(settings) {
+ const a=timeToMinutes(settings.work_start),b=timeToMinutes(settings.lunch_start),c=timeToMinutes(settings.lunch_end),d=timeToMinutes(settings.work_end);
+ if([a,b,c,d].some(x=>x==null||x%30!==0)||b-a!==240||d-c!==240||c<b)throw new HttpError(400,'근무기준을 확인해 주세요. 디엔엠은 오전·오후 각각 4시간, 하루 8시간 기준입니다. 관리자 → 근무·휴일 기준에서 조정해 주세요.');
+}
 function calculateHourlyLeave(s, user, startDateTime, endDateTime) {
   const start = parseLocalDateTime(startDateTime), end = parseLocalDateTime(endDateTime);
   if (!start || !end || cmpDateTime(end.raw, start.raw) <= 0) throw new HttpError(400, '시간단위 신청은 시작일시와 종료일시를 정확히 입력해 주세요.');
+  if (parseIso(end.date)-parseIso(start.date)>366*86400000)throw new HttpError(400,'신청 기간은 366일 이내로 나누어 주세요.');
   if (!isThirtyMinuteTime(start.time) || !isThirtyMinuteTime(end.time)) throw new HttpError(400, '시간단위 연차는 30분 단위로만 신청할 수 있습니다. 예: 09:00, 09:30');
-  const settings = getWorkSettings(s, user.company_id);
+  const settings = getWorkSettings(s, user.company_id);validateDnmWork(settings);
   const workStart = timeToMinutes(settings.work_start), lunchStart = timeToMinutes(settings.lunch_start), lunchEnd = timeToMinutes(settings.lunch_end), workEnd = timeToMinutes(settings.work_end);
   const workMinutes = workMinutesPerDay(settings);
   const details = workingDateDetails(s, user.company_id, start.date, end.date);
@@ -557,18 +532,19 @@ function calculateHourlyLeave(s, user, startDateTime, endDateTime) {
   if (totalMinutes % 30 !== 0) throw new HttpError(400, '시간단위 연차는 30분 단위로만 신청할 수 있습니다.');
   const hours = roundHours(totalMinutes / 60);
   return {
-    days: roundLeaveDays(totalMinutes / workMinutes), hours,
+    days: totalMinutes / DAY_MINUTES, minutes:totalMinutes, amount_parts:parts(totalMinutes), hours,
     start_date: start.date, end_date: end.date, start_time: start.time, end_time: end.time,
     start_datetime: start.raw, end_datetime: end.raw,
     charge_dates: [...new Set(hourlySegments.map((x) => x.date))], hourly_segments: hourlySegments,
-    excluded_dates: details.excluded_dates, work_settings: settings, work_hours_per_day: roundHours(workMinutes / 60)
+    excluded_dates: details.excluded_dates, work_settings: settings, work_hours_per_day: 8
   };
 }
 function calculateLeave(s, user, type, start, end, startDateTime = '', endDateTime = '') {
   if (!['FULL', 'AM_HALF', 'PM_HALF', 'HOURLY'].includes(type)) throw new HttpError(400, '연차 신청 구분을 확인해 주세요.');
   if (type === 'HOURLY') return calculateHourlyLeave(s, user, startDateTime, endDateTime);
   if (!parseIso(start) || !parseIso(end) || end < start) throw new HttpError(400, '신청 날짜를 정확히 입력해 주세요.');
-  const settings = getWorkSettings(s, user.company_id);
+  if (parseIso(end)-parseIso(start)>366*86400000)throw new HttpError(400,'신청 기간은 366일 이내로 나누어 주세요.');
+  const settings = getWorkSettings(s, user.company_id);validateDnmWork(settings);
   const workHours = roundHours(workMinutesPerDay(settings) / 60);
   if (type !== 'FULL') end = start;
   const details = workingDateDetails(s, user.company_id, start, end);
@@ -576,24 +552,24 @@ function calculateLeave(s, user, type, start, end, startDateTime = '', endDateTi
     if (!details.charge_dates.includes(start)) throw new HttpError(400, '토·일요일 또는 휴일에는 반차를 신청할 수 없습니다.');
     const startTime = type === 'AM_HALF' ? settings.work_start : settings.lunch_end;
     const endTime = type === 'AM_HALF' ? settings.lunch_start : settings.work_end;
-    return { days: 0.5, hours: roundHours(workHours / 2), start_date: start, end_date: start, start_time: startTime, end_time: endTime, start_datetime: `${start}T${startTime}`, end_datetime: `${start}T${endTime}`, charge_dates: [start], hourly_segments: [{ date: start, start_time: startTime, end_time: endTime, minutes: workMinutesPerDay(settings) / 2, hours: roundHours(workHours / 2) }], excluded_dates: [], work_settings: settings, work_hours_per_day: workHours };
+    return { days: 0.5, minutes:240, amount_parts:parts(240), hours:4, start_date: start, end_date: start, start_time: startTime, end_time: endTime, start_datetime: `${start}T${startTime}`, end_datetime: `${start}T${endTime}`, charge_dates: [start], hourly_segments: [{ date: start, start_time: startTime, end_time: endTime, minutes:240, hours:4 }], excluded_dates: [], work_settings: settings, work_hours_per_day: workHours };
   }
   if (!details.charge_dates.length) throw new HttpError(400, '선택한 기간에 연차 사용일로 계산되는 근무일이 없습니다.');
-  return { days: details.charge_dates.length, hours: roundHours(details.charge_dates.length * workHours), start_date: start, end_date: end, start_time: settings.work_start, end_time: settings.work_end, start_datetime: `${start}T${settings.work_start}`, end_datetime: `${end}T${settings.work_end}`, charge_dates: details.charge_dates, hourly_segments: null, excluded_dates: details.excluded_dates, work_settings: settings, work_hours_per_day: workHours };
+  return { days: details.charge_dates.length, minutes:details.charge_dates.length*DAY_MINUTES, amount_parts:parts(details.charge_dates.length*DAY_MINUTES), hours:details.charge_dates.length*8, start_date: start, end_date: end, start_time: settings.work_start, end_time: settings.work_end, start_datetime: `${start}T${settings.work_start}`, end_datetime: `${end}T${settings.work_end}`, charge_dates: details.charge_dates, hourly_segments: null, excluded_dates: details.excluded_dates, work_settings: settings, work_hours_per_day: workHours };
 }
 
-function renewalRows(s, ym, companyId = null, asOf = todayIsoKst()) {
-  const m = /^(\d{4})-(\d{2})$/.exec(String(ym || '')); if (!m) throw new HttpError(400, '조회 월을 YYYY-MM 형식으로 선택해 주세요.');
-  const year = Number(m[1]), month = Number(m[2]); if (month < 1 || month > 12) throw new HttpError(400, '조회 월을 확인해 주세요.');
-  return sortUsers(s, s.users.filter((u) => !u.is_system_account && !u.deleted && !hasRetireDate(u) && u.active && (!companyId || u.company_id === companyId))).map((u) => {
-    const ad = anniversaryInYear(u.join_date, year); if (!ad || ad.slice(5, 7) !== String(month).padStart(2, '0')) return null;
-    const p = priorCycleForAnniversary(u.join_date, ad); if (!p) return null;
-    const used = approvedUsedDays(s, u.id, p.prior_cycle_start, p.prior_cycle_end), adj = adjustmentTotal(s, u.id, p.prior_cycle_start, p.prior_cycle_end), bal = roundHalf(p.prior_granted + adj - used), nc = serviceCycle(u.join_date, ad);
-    const status = ad < asOf ? '갱신완료' : ad === asOf ? '오늘 갱신' : '갱신예정';
-    return { user_id: u.id, company_id: u.company_id, company_name: companyName(s, u.company_id), department: u.department || '', employee_code: u.employee_code || '', employee_name: u.employee_name, login_id: u.login_id, position: u.position || '', join_date: u.join_date, anniversary_date: ad, completed_years: p.completed_years, prior_cycle_start: p.prior_cycle_start, prior_cycle_end: p.prior_cycle_end, prior_granted: p.prior_granted, prior_used: used, prior_adjustments: adj, prior_balance: bal, unused_expiring: Math.max(0, bal), overused: Math.max(0, -bal), new_entitlement: p.new_entitlement, new_cycle_start: nc?.cycle_start || ad, new_cycle_end: nc?.cycle_end || '', status, settlement_due: ad <= asOf };
-  }).filter(Boolean).sort((a, b) => a.anniversary_date.localeCompare(b.anniversary_date) || a.company_name.localeCompare(b.company_name, 'ko') || a.employee_name.localeCompare(b.employee_name, 'ko'));
+function renewalRows(s,ym,companyId=null,asOf=todayIsoKst()) {
+ const m=/^(\d{4})-(\d{2})$/.exec(String(ym||''));if(!m||Number(m[2])<1||Number(m[2])>12)throw new HttpError(400,'조회 월을 확인해 주세요.');
+ return sortUsers(s,s.users.filter(u=>!u.is_system_account&&!u.deleted&&(!companyId||u.company_id===companyId))).map(u=>{
+  const ad=anniversaryInYear(basisDate(u),Number(m[1]));if(!ad||ad.slice(0,7)!==ym||(u.retire_date&&u.retire_date<=ad))return null;
+  const prev=cycleBalance(s,u,addDays(ad,-1)), next=cycleBalance(s,u,ad); if(!prev||!next)return null;
+  const unused=Math.max(0,prev.amounts.remaining.minutes),over=Math.max(0,-prev.amounts.remaining.minutes);
+  return {user_id:u.id,company_id:u.company_id,company_name:companyName(s,u.company_id),department:u.department,employee_code:u.employee_code,employee_name:u.employee_name,login_id:u.login_id,position:u.position,join_date:u.join_date,leave_basis_date:basisDate(u),anniversary_date:ad,completed_years:next.service_year,
+    prior_cycle_start:prev.cycle_start,prior_cycle_end:prev.cycle_end,prior_granted:prev.granted,prior_used:prev.used,prior_adjustments:prev.adjustments,prior_balance:prev.remaining,unused_expiring:unused/DAY_MINUTES,overused:over/DAY_MINUTES,new_entitlement:next.granted,new_cycle_start:next.cycle_start,new_cycle_end:next.cycle_end,
+    amounts:{prior_granted:prev.amounts.granted,prior_used:prev.amounts.used,prior_adjustments:prev.amounts.adjustments,prior_balance:prev.amounts.remaining,unused_expiring:parts(unused),overused:parts(over),new_entitlement:next.amounts.granted},
+    status:ad<asOf?'갱신완료':ad===asOf?'오늘 갱신':'갱신예정',settlement_due:ad<=asOf,settlement_status:'수당·소멸예외 별도확인',carryover_minutes:0};
+ }).filter(Boolean).sort((a,b)=>a.anniversary_date.localeCompare(b.anniversary_date)||a.employee_name.localeCompare(b.employee_name,'ko'));
 }
-
 async function sessionUser(request, env, s) {
   const token = getCookie(request, 'leave.sid'); if (!token) return null;
   const row = await readSession(env, token); if (!row || Number(row.expires_at) < Date.now()) { if (row) await deleteSession(env, token); return null; }
@@ -643,7 +619,7 @@ function worksheetRows(ws) {
   const rows = []; let headers = [];
   ws.eachRow({ includeEmpty: false }, (row, rowNo) => {
     const vals = []; for (let c = 1; c <= row.cellCount; c += 1) vals.push(cellValue(row.getCell(c)));
-    if (!headers.length) { headers = vals.map((x) => cleanText(x, 100)); return; }
+    if (!headers.length) {const candidate=vals.map(x=>cleanText(x,100));if(candidate.some(x=>['직원명','성명','로그인 ID','로그인ID'].includes(x)))headers=candidate;return;}
     const obj = {}; headers.forEach((h, i) => { if (h) obj[h] = vals[i] ?? ''; });
     if (Object.values(obj).some((x) => String(x).trim() !== '')) rows.push({ rowNo, ...obj });
   });
@@ -658,12 +634,111 @@ function excelDate(v) {
 }
 function findCompanyIdByName(s, name) { const t = cleanText(name, 100); return s.companies.find((c) => c.name === t)?.id || null; }
 
+function staffExtras(body) {
+  const result={};
+  for(const f of ['gender','age_source','address','career','employment_note'])if(Object.hasOwn(body,f))result[f]=cleanText(body[f],f==='career'?2000:500);
+  if(Object.hasOwn(body,'leave_basis_date')) {
+    const date=cleanText(body.leave_basis_date,10);if(date&&!parseIso(date))throw new HttpError(400,'연차 산정 기준일을 확인해 주세요.');result.leave_basis_date=date;
+  }
+  return result;
+}
+function staffRow(s,u) {
+ return {...userSummary(s,u),...Object.fromEntries(['gender','age_source','address','career','employment_note','review_notes','roster_source_record'].map(f=>[f,u[f]??''])),updated_at:u.updated_at};
+}
+async function rosterRoutes({request,env,s,version,url,pathname,method,body}) {
+ if(method==='GET'&&pathname==='/api/leave-ledger') {
+  const actor=await requireAuth(request,env,s),uid=numberId(url.searchParams.get('user_id'))||actor.id;
+  if(uid!==actor.id&&!(actor.is_admin||actor.is_representative))throw new HttpError(403,'본인의 연차대장만 조회할 수 있습니다.');
+  const u=userById(s,uid);if(!u||u.is_system_account)throw new HttpError(400,'직원을 선택해 주세요.');
+  const asOf=cleanText(url.searchParams.get('as_of')||todayIsoKst(),10);if(!parseIso(asOf))throw new HttpError(400,'조회 기준일을 확인해 주세요.');
+  return json({employee:userSummary(s,u,asOf),cycles:cycleHistory(s,u,asOf),adjustments:s.adjustments.filter(x=>x.user_id===uid).map(x=>({...x,amount_parts:parts(x.minutes),created_by_name:userById(s,x.created_by)?.employee_name||''})),grant_overrides:s.cycle_grants.filter(x=>x.user_id===uid),policy:{day_minutes:480,unit_minutes:30,rollover:'NO_CARRYOVER',automatic_grant_assumption:'월 개근 및 연 출근율 요건 충족 가정. 실제 출근율·소멸 예외는 관리자 확인.'}});
+ }
+ if(!pathname.startsWith('/api/roster')&&!pathname.startsWith('/api/admin/cycle-grant'))return null;
+ const actor=await requireAdmin(request,env,s);
+ if(method==='GET'&&pathname==='/api/roster') {
+  const source=s.roster_source||{};
+  return json({employees:sortUsers(s,s.users.filter(x=>!x.is_system_account&&!x.deleted&&!x.legacy_hidden)).map(x=>staffRow(s,x)),history:s.roster_history||[],audit:[...(s.staff_audit||[])].reverse(),source});
+ }
+ if(method==='POST'&&pathname==='/api/roster/preview') {
+  let source;
+  if(body.source==='bundled')source=structuredClone(ROSTER_2026);
+  else {
+   const form=await request.formData(), file=form.get('file');
+   if(!file||typeof file.arrayBuffer!=='function')throw new HttpError(400,'Excel 파일을 선택해 주세요.');
+   if(file.size>4*1024*1024)throw new HttpError(400,'Excel 파일은 4MB 이하로 업로드해 주세요.');
+   const wb=new ExcelJS.Workbook();await wb.xlsx.load(Buffer.from(await file.arrayBuffer()));
+   try{source=parseRosterWorkbook(wb,cleanText(file.name,120));}catch(e){throw new HttpError(400,e.message);}
+  }
+  const entries=source.current.map((r,index)=>{
+   const u=matchEmployee(s.users,r), changes=importChanges(u,r);
+   return {index,user_id:u?.id||null,name:r.employee_name,department:r.department,action:u?'UPDATE':'CREATE',changes,review_notes:r.review_notes||[],join_date:r.join_date};
+  });
+  const token=crypto.randomUUID();await env.sessionStore.setJSON(`roster-preview:${token}`,{actor_id:actor.id,expires_at:Date.now()+15*60*1000,source,entries,state_version:version});
+  return json({token,source_file:source.source_file,source_as_of_text:source.source_as_of_text,entries,counts:source.counts,history_count:source.history.length,errors:source.errors||[],privacy_note:source.privacy_note});
+ }
+ if(method==='POST'&&pathname==='/api/roster/commit') {
+  const token=cleanText(body.token,60),key=`roster-preview:${token}`,preview=await env.sessionStore.get(key,{type:'json',consistency:'strong'});
+  if(!preview||preview.actor_id!==actor.id||preview.expires_at<Date.now())throw new HttpError(400,'미리보기가 만료되었습니다. 다시 불러와 주세요.');
+  if(preview.state_version!==version)throw new HttpError(409,'미리보기 이후 운영자료가 변경되었습니다. 다시 미리보기를 확인해 주세요.');
+  const indices=[...new Set((Array.isArray(body.indices)?body.indices:[]).map(Number))];
+  if(!indices.length&&!body.include_history)throw new HttpError(400,'적용할 직원을 선택해 주세요.');
+  const result={created:0,updated:0,history_saved:0,new_accounts:[]};
+  for(const i of indices) {
+   if(!Number.isInteger(i)||i<0||i>=preview.source.current.length)throw new HttpError(400,'선택한 행을 확인해 주세요.');
+   const r=preview.source.current[i], entry=preview.entries[i];let u=entry.user_id?userById(s,entry.user_id):null;
+   if(!parseIso(r.join_date)||!r.employee_name)throw new HttpError(400,'이름과 입사일을 확인해 주세요.');
+   if(r.retire_date&&(!parseIso(r.retire_date)||r.retire_date<r.join_date))throw new HttpError(400,'명부의 퇴사일을 확인해 주세요.');
+   if(u) {
+    const before=structuredClone(u);u.leave_basis_date ||= u.join_date;
+    // Do not reset passwords, roles, account status, or previous leave basis date during a roster import.
+    for(const f of ROSTER_FIELDS)if(!['employee_code','leave_basis_date','retire_date'].includes(f)&&r[f]!==undefined)u[f]=cleanText(r[f],f==='career'?2000:500);
+    if(r.retire_date){u.retire_date=r.retire_date;if(isRetiredAsOf(u)){u.active=false;rejectPendingForUnavailableApprover(s,u.id,'명부 반영으로 결재자가 퇴사 처리되었습니다. 결재자를 다시 지정해 주세요.');}}
+    u.roster_source_record=structuredClone(r);u.review_notes=r.review_notes||[];u.updated_at=nowIso();
+    auditStaff(s,actor,u,before,'EXCEL_UPDATE',`${preview.source.source_file} / ${r.source_row}행`);result.updated++;
+   } else {
+    const t=nowIso(),login=generateLoginId(s,r.login_id||r.suggested_login||r.employee_name),cid=s.companies.find(c=>c.active)?.id;
+    u={id:s.counters.user++,company_id:cid,employee_code:cleanText(r.employee_code||r.suggested_employee_code||'',40),employee_name:r.employee_name,login_id:login,password_hash:await passwordHash('1111'),is_system_account:false,is_admin:false,is_representative:false,can_approve_first:false,can_approve_final:false,active:!r.retire_date,deleted:false,legacy_hidden:false,must_change_password:true,created_at:t,updated_at:t};
+    for(const f of ROSTER_FIELDS)if(!['employee_code','employee_name'].includes(f)&&r[f]!==undefined)u[f]=cleanText(r[f],f==='career'?2000:500);
+    u.leave_basis_date ||= u.join_date;u.roster_source_record=structuredClone(r);u.review_notes=r.review_notes||[];
+    s.users.push(u);auditStaff(s,actor,u,null,'EXCEL_CREATE');result.created++;result.new_accounts.push({login_id:login,employee_name:u.employee_name});
+   }
+  }
+  if(body.include_history){
+   const map=new Map((s.roster_history||[]).map(x=>[`${x.source_sheet}:${x.section}:${x.source_row}`,x]));
+   for(const r of preview.source.history){const k=`${r.source_sheet}:${r.section}:${r.source_row}`;if(!map.get(k)?.admin_updated){map.set(k,r);result.history_saved++;}}
+   s.roster_history=[...map.values()];
+  }
+  s.roster_source={source_file:preview.source.source_file,source_as_of_text:preview.source.source_as_of_text,counts:preview.source.counts,imported_at:nowIso(),imported_by:actor.employee_name};
+  await saveState(env,version,s);await env.sessionStore.delete(key);return json(result);
+ }
+ const hm=/^\/api\/roster\/history\/(\d+)$/.exec(pathname);
+ if(method==='PUT'&&hm){
+  const index=Number(hm[1]),r=s.roster_history[index];if(!r)throw new HttpError(404,'명부 이력을 찾을 수 없습니다.');
+  const before=structuredClone(r);
+  for(const f of ['note','retire_date','department','position','address','career','phone'])if(Object.hasOwn(body,f))r[f]=cleanText(body[f],2000);
+  if(r.retire_date&&!parseIso(r.retire_date))throw new HttpError(400,'퇴사일 형식을 확인해 주세요.');
+  r.admin_updated=true;r.updated_at=nowIso();auditStaff(s,actor,{...r,id:null},before,'HISTORY_EDIT',`명부 ${r.source_row}행`);await saveState(env,version,s);return json({ok:true});
+ }
+ if(method==='POST'&&pathname==='/api/admin/cycle-grant') {
+  const u=userById(s,body.user_id),date=cleanText(body.cycle_start,10),reason=cleanText(body.reason,500);
+  if(!u||u.is_system_account||!parseIso(date)||!reason)throw new HttpError(400,'직원·주기 시작일·확인 사유를 입력해 주세요.');
+  const cyc=cycleBalance(s,u,date);if(!cyc||cyc.cycle_start!==date)throw new HttpError(400,'직원의 연차주기 시작일이 아닙니다.');
+  let minutes;try{minutes=minutesFromParts(body.days_whole,body.hours_remainder||0);}catch(e){throw new HttpError(400,e.message);}
+  const record={user_id:u.id,cycle_start:date,minutes,reason,created_by:actor.id,updated_at:nowIso()};
+  s.cycle_grants=s.cycle_grants.filter(x=>!(x.user_id===u.id&&x.cycle_start===date));s.cycle_grants.push(record);
+  auditStaff(s,actor,u,null,'GRANT_CONFIRM',`${date} / ${minutes}분 / ${reason}`);await saveState(env,version,s);return json({ok:true});
+ }
+ return null;
+}
+
 async function handle(context) {
-  const { request, env } = context; await initDb(env); const { version, state: s } = await loadState(env);
+  const { request, env } = context;
+  if(!['GET','HEAD','OPTIONS'].includes(request.method)){const origin=request.headers.get('origin');if(origin && origin!==new URL(request.url).origin)throw new HttpError(403,'다른 사이트에서의 변경 요청은 허용하지 않습니다.');}
+  await initDb(env); const { version, state: s } = await loadState(env);
   const url = new URL(request.url), pathname = url.pathname, method = request.method, body = await parseBody(request);
 
-  if (method === 'GET' && pathname === '/api/health') return json({ ok: true, service: 'dnm-annual-leave-manager-netlify-v8.1-hourly', date: todayIsoKst(), storage: 'Netlify Blobs' });
-  if (method === 'GET' && pathname === '/api/initial-info') return json({ company_count: s.companies.filter((c) => c.active).length, employee_count: s.users.filter((u) => !u.is_system_account && !u.deleted && !hasRetireDate(u)).length, source: s.source_verification || null, version: APP_VERSION });
+  if (method === 'GET' && pathname === '/api/health') return json({ ok: true, service: 'dnm-annual-leave-manager', version: APP_VERSION, date: todayIsoKst(), storage: 'Netlify Blobs' });
+  if (method === 'GET' && pathname === '/api/initial-info') return json({ company_count: s.companies.filter((c) => c.active).length, employee_count: s.users.filter((u) => !u.is_system_account && !u.deleted && !hasRetireDate(u)).length, version: APP_VERSION });
 
   if (method === 'POST' && pathname === '/api/login') {
     const loginId = loginKey(body.login_id), password = String(body.password || ''), u = userByLogin(s, loginId);
@@ -671,23 +746,21 @@ async function handle(context) {
     if (isRetiredAsOf(u)) throw new HttpError(401, '퇴사 처리된 계정입니다. 관리자에게 문의해 주세요.');
     if (!u.active) throw new HttpError(401, '사용이 중지된 계정입니다. 관리자에게 문의해 주세요.');
     let ok = await verifyPassword(password, u.password_hash);
-    // 신규등록/PW초기화 계정은 반드시 1111로 들어갈 수 있도록 해시 손상까지 자동 복구합니다.
-    if (!ok && password === '1111' && u.must_change_password) {
-      u.password_hash = await passwordHash('1111'); u.updated_at = nowIso(); await saveState(env, version, s); ok = true;
-    }
     if (!ok) throw new HttpError(401, '로그인 ID 또는 비밀번호가 올바르지 않습니다.');
     const token = randomHex(32), exp = Date.now() + SESSION_SECONDS * 1000; await createSession(env, token, u.id, exp);
     return json(userSummary(s, u), 200, { 'Set-Cookie': `leave.sid=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_SECONDS}` });
   }
-  if (method === 'POST' && pathname === '/api/logout') { await requireAuth(request, env, s); const token = getCookie(request, 'leave.sid'); if (token) await deleteSession(env, token); return json({ ok: true }, 200, { 'Set-Cookie': 'leave.sid=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0' }); }
+  if (method === 'POST' && pathname === '/api/logout') { const token = getCookie(request, 'leave.sid'); if (token) await deleteSession(env, token); return json({ ok: true }, 200, { 'Set-Cookie': 'leave.sid=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0' }); }
   if (method === 'GET' && pathname === '/api/me') return json(userSummary(s, await requireAuth(request, env, s)));
   if (method === 'POST' && pathname === '/api/change-password') {
     const u = await requireAuth(request, env, s), cur = String(body.current_password || ''), np = String(body.new_password || ''), cp = String(body.confirm_password || '');
     if (!await verifyPassword(cur, u.password_hash)) throw new HttpError(400, '현재 비밀번호가 일치하지 않습니다.');
-    if (np.length < 4 || np.length > 100) throw new HttpError(400, '새 비밀번호는 4자 이상 100자 이하로 입력해 주세요.');
-    if (np !== cp) throw new HttpError(400, '새 비밀번호 확인이 일치하지 않습니다.'); if (np === '1111') throw new HttpError(400, '초기 비밀번호 1111과 다른 비밀번호를 사용해 주세요.');
+    if (np.length < 8 || np.length > 100) throw new HttpError(400, '새 비밀번호는 8자 이상 100자 이하로 입력해 주세요.');
+    if (np !== cp) throw new HttpError(400, '새 비밀번호 확인이 일치하지 않습니다.'); if (['1111','0996'].includes(np)) throw new HttpError(400, '초기 비밀번호 1111과 다른 비밀번호를 사용해 주세요.');
     u.password_hash = await passwordHash(np); u.must_change_password = false; u.updated_at = nowIso(); await saveState(env, version, s); return json({ ok: true });
   }
+
+  const rosterResponse=await rosterRoutes({request,env,s,version,url,pathname,method,body});if(rosterResponse)return rosterResponse;
 
   if (method === 'GET' && pathname === '/api/companies') { await requireAuth(request, env, s); return json([...s.companies].sort((a, b) => a.name.localeCompare(b.name, 'ko'))); }
   if (method === 'POST' && pathname === '/api/companies') {
@@ -742,11 +815,11 @@ async function handle(context) {
       approval_steps: approvalSteps, approval_state: 'PENDING',
       leave_type: type, start_date: start, end_date: end, start_time: calc.start_time, end_time: calc.end_time,
       start_datetime: calc.start_datetime || '', end_datetime: calc.end_datetime || '',
-      charge_dates: calc.charge_dates, hourly_segments: calc.hourly_segments || null, days: calc.days, hours: calc.hours, reason, status1: 'PENDING', status_final: 'WAITING',
+      charge_dates: calc.charge_dates, hourly_segments: calc.hourly_segments || null, minutes:calc.minutes, days: calc.days, hours: calc.hours, reason, status1: 'PENDING', status_final: 'WAITING',
       reject_reason: '', source: 'APPLICATION', source_note: '', created_at: t, updated_at: t,
       approved1_at: null, final_approved_at: null, cancelled_at: null
     };
-    s.requests.push(rec); await saveState(env, version, s);
+    normalizeCharge(rec); s.requests.push(rec); await saveState(env, version, s);
     return json({ ok: true, id: rec.id, days: rec.days, hours: rec.hours, excluded_dates: calc.excluded_dates, start_time: rec.start_time, end_time: rec.end_time, start_datetime: rec.start_datetime, end_datetime: rec.end_datetime, approval_steps: requestRow(s, rec).approval_line });
   }
   if (method === 'GET' && pathname === '/api/my-requests') {
@@ -794,6 +867,7 @@ async function handle(context) {
     if (action === 'reject' && !reason) throw new HttpError(400, '반려 사유를 입력해 주세요.');
     step.status = action === 'approve' ? 'APPROVED' : 'REJECTED';
     step.action_at = t; step.comment = action === 'reject' ? reason : '';
+    if(action==='reject')for(const x of r.approval_steps)if(x.order>step.order&&['WAITING','PENDING'].includes(x.status))x.status='WAITING';
     if (action === 'approve') {
       const next = r.approval_steps.find((x) => x.order === step.order + 1);
       if (next && next.status === 'WAITING') next.status = 'PENDING';
@@ -809,8 +883,8 @@ async function handle(context) {
     const users = s.users.filter((u) => !u.is_system_account && !u.deleted && employmentMatches(u, employment) && (!cid || u.company_id === cid));
     const ids = new Set(users.map((u) => u.id)), rs = s.requests.filter((r) => ids.has(r.user_id)), cy = todayIsoKst().slice(0, 4);
     return json({ employee_count: ids.size, pending_count: rs.filter((r) => r.source === 'APPLICATION' && approvalStateOf(r) === 'PENDING').length,
-      approved_this_year: roundHalf(rs.filter((r) => r.start_date.startsWith(cy) && r.status1 === 'APPROVED' && r.status_final === 'APPROVED').reduce((sum, r) => sum + Number(r.days), 0)),
-      total_used: roundHalf(users.reduce((sum, u) => sum + approvedUsedDays(s, u.id), 0)) });
+      approved_this_year: rs.filter(r=>approvalStateOf(r)==='APPROVED').reduce((sum,r)=>sum+requestMinutesInRange(r,`${cy}-01-01`,`${cy}-12-31`),0)/DAY_MINUTES,
+      total_used: users.reduce((sum, u) => sum + approvedUsedDays(s, u.id), 0) });
   }
   if (method === 'GET' && pathname === '/api/users') {
     await requireAdmin(request, env, s);
@@ -826,7 +900,7 @@ async function handle(context) {
     return json(rows.map((u) => userSummary(s, u)));
   }
   if (method === 'POST' && pathname === '/api/users') {
-    await requireAdmin(request, env, s);
+    const actor = await requireAdmin(request, env, s);
     const cid = numberId(body.company_id), company = activeCompany(s, cid), name = cleanText(body.employee_name, 100), join = cleanText(body.join_date, 10), retire = cleanText(body.retire_date, 10);
     if (!company || !name || !parseIso(join)) throw new HttpError(400, '회사, 직원명, 입사일을 정확히 입력해 주세요.');
     if (retire && (!parseIso(retire) || retire < join)) throw new HttpError(400, '퇴사일은 입사일 이후 날짜로 입력해 주세요.');
@@ -840,12 +914,14 @@ async function handle(context) {
       active: retiredNow ? false : (body.active == null ? true : boolValue(body.active)), deleted: false, legacy_hidden: false, must_change_password: true,
       source_accrued: null, source_used: null, source_remaining: null, created_at: t, updated_at: t
     };
+    Object.assign(u,staffExtras(body));u.leave_basis_date ||= join;auditStaff(s,actor,u,null,'CREATE');
     s.users.push(u); await saveState(env, version, s);
     return json({ id: u.id, login_id: u.login_id, default_password: '1111' });
   }
   p = matchPath(pathname, /^\/api\/users\/(\d+)$/);
   if (method === 'PUT' && p) {
-    await requireAdmin(request, env, s); const u = userById(s, p[0]);
+    const actor=await requireAdmin(request, env, s); const u = userById(s, p[0]);
+    const before=u?structuredClone(u):null;
     if (!u || u.deleted) throw new HttpError(404, '사용자를 찾을 수 없습니다.');
     if (u.is_system_account) throw new HttpError(400, '관리자 시스템 계정은 직원정보 수정 대상이 아닙니다. 비밀번호 변경 또는 PW초기화를 사용해 주세요.');
     const cid = numberId(body.company_id || u.company_id); if (!activeCompany(s, cid)) throw new HttpError(400, '회사를 확인해 주세요.');
@@ -856,10 +932,13 @@ async function handle(context) {
     if (s.users.some((x) => !x.deleted && !x.legacy_hidden && loginKey(x.login_id) === login && x.id !== u.id)) throw new HttpError(400, '이미 사용 중인 로그인 ID입니다.');
     const retiredNow = Boolean(retire && retire <= todayIsoKst()), requestedActive = body.active == null ? u.active : boolValue(body.active), newActive = retiredNow ? false : requestedActive;
     const wasAvailableApprover = userAvailable(u) && u.can_approve_first;
+    if(actor.id===u.id && (u.is_admin||u.is_representative) && !boolValue(body.is_admin))throw new HttpError(400,'본인의 관리자 권한은 직접 해제할 수 없습니다.');
+    if(u.is_representative && !boolValue(body.is_admin))throw new HttpError(400,'대표이사 계정은 관리자 권한을 유지합니다.');
     Object.assign(u, { company_id: cid, employee_code: cleanText(body.employee_code, 40), employee_name: name, login_id: login,
       department: cleanText(body.department, 100), position: cleanText(body.position, 100), join_date: join, retire_date: retire, phone: cleanText(body.phone, 50), note: cleanText(body.note, 500),
-      is_admin: boolValue(body.is_admin), is_representative: false, can_approve_first: boolValue(body.can_approve_first), can_approve_final: false,
+      is_admin: boolValue(body.is_admin), is_representative: Boolean(u.is_representative), can_approve_first: boolValue(body.can_approve_first), can_approve_final: Boolean(u.can_approve_final),
       is_system_account: false, active: newActive, updated_at: nowIso() });
+    Object.assign(u,staffExtras(body));auditStaff(s,actor,u,before,'UPDATE');
     if (wasAvailableApprover && (!userAvailable(u) || !u.can_approve_first)) rejectPendingForUnavailableApprover(s, u.id, '승인자가 퇴사·비활성화되었거나 승인권한이 해제되어 반려 처리되었습니다. 승인자를 다시 선택하여 재신청해 주세요.');
     await saveState(env, version, s); return json({ ok: true, login_id: u.login_id, active: u.active, retire_date: u.retire_date });
   }
@@ -885,7 +964,11 @@ async function handle(context) {
   }
   p = matchPath(pathname, /^\/api\/users\/(\d+)\/adjustments$/);
   if (method === 'POST' && p) {
-    const admin = await requireAdmin(request, env, s), u = userById(s, p[0]), amount = Number(body.amount), reason = cleanText(body.reason, 500); if (!u || u.is_system_account) throw new HttpError(400, '연차 조정 대상 사용자를 확인해 주세요.'); if (!Number.isFinite(amount) || amount === 0 || Math.abs(amount * 2 - Math.round(amount * 2)) > 1e-9) throw new HttpError(400, '조정 일수는 0.5일 단위의 0이 아닌 값으로 입력해 주세요.'); if (!reason) throw new HttpError(400, '조정 사유를 입력해 주세요.'); const rec = { id: s.counters.adjustment++, user_id: u.id, amount, reason, effective_date: cleanText(body.effective_date || todayIsoKst(), 10), created_by: admin.id, created_at: nowIso() }; if (!parseIso(rec.effective_date)) throw new HttpError(400, '적용일을 확인해 주세요.'); s.adjustments.push(rec); await saveState(env, version, s); return json({ ok: true, id: rec.id, summary: userSummary(s, u) });
+    const admin=await requireAdmin(request,env,s),u=userById(s,p[0]);if(!u||u.is_system_account)throw new HttpError(400,'대상 직원을 확인해 주세요.');
+    let minutes;try {minutes=body.days_whole!=null?minutesFromParts(body.days_whole,body.hours_remainder||0,body.direction||1):Math.round(Number(body.amount)*DAY_MINUTES);}catch(e){throw new HttpError(400,e.message);}
+    if(!Number.isFinite(minutes)||minutes===0||minutes%30!==0)throw new HttpError(400,'조정은 0이 아닌 0.5시간 단위로 입력해 주세요.');
+    const reason=cleanText(body.reason,500),date=cleanText(body.effective_date||todayIsoKst(),10);if(!reason||!parseIso(date))throw new HttpError(400,'적용일과 조정 사유를 확인해 주세요.');
+    const rec={id:s.counters.adjustment++,user_id:u.id,minutes,amount:minutes/DAY_MINUTES,reason,effective_date:date,created_by:admin.id,created_at:nowIso()};s.adjustments.push(rec);auditStaff(s,admin,u,null,'LEAVE_ADJUST',`${date} / ${minutes}분 / ${reason}`);await saveState(env,version,s);return json({ok:true,id:rec.id,summary:userSummary(s,u)});
   }
   if (method === 'GET' && p) { await requireAdmin(request, env, s); const uid = Number(p[0]); return json(s.adjustments.filter((x) => x.user_id === uid).sort((a, b) => b.id - a.id).map((x) => { const u = userById(s, x.user_id), m = userById(s, x.created_by); return { ...x, employee_name: u?.employee_name || '', login_id: u?.login_id || '', company_name: companyName(s, u?.company_id), created_by_name: m?.employee_name || '' }; })); }
 
@@ -898,7 +981,7 @@ async function handle(context) {
     await requireAdmin(request, env, s); const cid = numberId(url.searchParams.get('company_id')); if (cid) return json(getWorkSettings(s, cid)); return json(s.companies.filter((c) => c.active).map((c) => ({ company_id: c.id, company_name: c.name, ...getWorkSettings(s, c.id) })));
   }
   if (method === 'PUT' && pathname === '/api/admin/work-settings') {
-    await requireAdmin(request, env, s); const cid = numberId(body.company_id); if (!activeCompany(s, cid)) throw new HttpError(400, '회사를 확인해 주세요.'); const vals = { work_start: cleanText(body.work_start, 5), lunch_start: cleanText(body.lunch_start, 5), lunch_end: cleanText(body.lunch_end, 5), work_end: cleanText(body.work_end, 5) }; if (!Object.values(vals).every(validTime)) throw new HttpError(400, '근무시간은 HH:MM 형식으로 입력해 주세요.'); if (!(vals.work_start < vals.lunch_start && vals.lunch_start < vals.lunch_end && vals.lunch_end < vals.work_end)) throw new HttpError(400, '근무 시작 < 점심 시작 < 점심 종료 < 근무 종료 순서로 입력해 주세요.'); const w = getWorkSettings(s, cid); Object.assign(w, vals, { company_id: cid, updated_at: nowIso() }); if (!s.work_settings.some((x) => Number(x.company_id) === cid)) s.work_settings.push(w); await saveState(env, version, s); return json(w);
+    await requireAdmin(request, env, s); const cid = numberId(body.company_id); if (!activeCompany(s, cid)) throw new HttpError(400, '회사를 확인해 주세요.'); const vals = { work_start: cleanText(body.work_start, 5), lunch_start: cleanText(body.lunch_start, 5), lunch_end: cleanText(body.lunch_end, 5), work_end: cleanText(body.work_end, 5) }; if (!Object.values(vals).every(validTime)) throw new HttpError(400, '근무시간은 HH:MM 형식으로 입력해 주세요.'); if (!(vals.work_start < vals.lunch_start && vals.lunch_start < vals.lunch_end && vals.lunch_end < vals.work_end)) throw new HttpError(400, '근무 시작 < 점심 시작 < 점심 종료 < 근무 종료 순서로 입력해 주세요.'); if(!Object.values(vals).every(isThirtyMinuteTime)||timeToMinutes(vals.lunch_start)-timeToMinutes(vals.work_start)!==240||timeToMinutes(vals.work_end)-timeToMinutes(vals.lunch_end)!==240)throw new HttpError(400,'디엔엠은 1일 8시간(오전·오후 각 4시간), 30분 경계의 근무기준으로 관리합니다.'); const w = getWorkSettings(s, cid); Object.assign(w, vals, { company_id: cid, updated_at: nowIso() }); if (!s.work_settings.some((x) => Number(x.company_id) === cid)) s.work_settings.push(w); await saveState(env, version, s); return json(w);
   }
   if (method === 'GET' && pathname === '/api/admin/holidays') {
     await requireAdmin(request, env, s); const cid = numberId(url.searchParams.get('company_id')); const year = Number(url.searchParams.get('year') || todayIsoKst().slice(0, 4)); const start = `${year}-01-01`, end = `${year}-12-31`; return json({ year, rows: holidayRows(s, cid, start, end), custom: s.custom_holidays.filter((h) => !cid || !h.company_id || Number(h.company_id) === cid).sort((a, b) => a.date.localeCompare(b.date)) });
@@ -927,7 +1010,7 @@ async function handle(context) {
   if (method === 'POST' && pathname === '/api/admin/import-excel') {
     await requireAdmin(request, env, s); const form = await request.formData(); const file = form.get('file'); if (!file || typeof file.arrayBuffer !== 'function') throw new HttpError(400, '업로드할 Excel 파일을 선택해 주세요.'); if (Number(file.size || 0) > 8 * 1024 * 1024) throw new HttpError(400, 'Excel 파일은 8MB 이하로 업로드해 주세요.');
     const wb = new ExcelJS.Workbook(); await wb.xlsx.load(Buffer.from(await file.arrayBuffer()));
-    const result = { users_created: 0, users_updated: 0, usage_created: 0, errors: [] };
+    const result = { users_created: 0, users_updated: 0, usage_created: 0, skipped:0, errors: [] };
     const wsUsers = wb.getWorksheet('직원등록') || wb.worksheets.find((x) => x.name.includes('직원'));
     if (wsUsers) for (const row of worksheetRows(wsUsers)) {
       try {
@@ -947,7 +1030,7 @@ async function handle(context) {
         } else {
           Object.assign(u, { company_id: cid, employee_code: cleanText(pick(row, ['사원코드', '사번']) || u.employee_code, 40), employee_name: name,
             department: cleanText(pick(row, ['부서']) || u.department, 100), position: cleanText(pick(row, ['직급', '직책']) || u.position, 100), join_date: join, retire_date: retire || '',
-            is_admin: false, can_approve_first: boolValue(pick(row, ['승인자', '연차 승인자', '1차 승인자', '1차승인자'])), can_approve_final: false, is_representative: false,
+            is_admin: Boolean(u.is_admin), can_approve_first: pick(row, ['승인자','연차 승인자'])==='' ? Boolean(u.can_approve_first) : boolValue(pick(row,['승인자','연차 승인자'])), can_approve_final: Boolean(u.can_approve_final), is_representative: Boolean(u.is_representative),
             active: retire && retire <= todayIsoKst() ? false : u.active, updated_at: nowIso() }); result.users_updated += 1;
         }
       } catch (e) { result.errors.push(`직원등록 ${row.rowNo}행: ${e.message}`); }
@@ -956,8 +1039,14 @@ async function handle(context) {
     if (wsUsage) for (const row of worksheetRows(wsUsage)) {
       try {
         const cname = cleanText(pick(row, ['회사', '회사명']), 100), cid = findCompanyIdByName(s, cname); if (!cid) throw new Error('회사 확인'); const login = cleanText(pick(row, ['로그인 ID', '로그인ID', 'ID']), 80), ename = cleanText(pick(row, ['직원명', '성명', '이름']), 100); let u = login ? userByLogin(s, login) : s.users.find((x) => x.company_id === cid && x.employee_name === ename && !x.is_system_account); if (!u) throw new Error('직원 확인');
-        const label = cleanText(pick(row, ['구분', '사용구분']), 30), map = { '오전 반차': 'AM_HALF', '오전반차': 'AM_HALF', '오후 반차': 'PM_HALF', '오후반차': 'PM_HALF', '반차': 'HALF_IMPORTED', '연차': 'FULL', '하루': 'FULL', '기간': 'FULL' }; const type = map[label] || 'FULL'; const start = excelDate(pick(row, ['시작일', '사용일', '일자'])), end = excelDate(pick(row, ['종료일'])) || start; if (!parseIso(start) || !parseIso(end)) throw new Error('사용일 확인'); let days = Number(pick(row, ['일수', '사용일수'])); let calc = null; if (!Number.isFinite(days) || days <= 0) { calc = calculateLeave(s, u, type === 'HALF_IMPORTED' ? 'AM_HALF' : type, start, end); days = calc.days; }
-        const t = nowIso(), rec = { id: s.counters.request++, user_id: u.id, approver1_id: null, final_approver_id: null, leave_type: type, start_date: start, end_date: type.includes('HALF') ? start : end, start_time: calc?.start_time || '', end_time: calc?.end_time || '', charge_dates: calc?.charge_dates || null, days: roundHalf(days), reason: cleanText(pick(row, ['사유', '신청사유']) || 'Excel 업로드 이관', 500), status1: 'APPROVED', status_final: 'APPROVED', reject_reason: '', source: 'EXCEL_UPLOAD', source_note: cleanText(pick(row, ['자료설명', '비고']) || file.name, 300), created_at: t, updated_at: t, approved1_at: t, final_approved_at: t, cancelled_at: null }; s.requests.push(rec); result.usage_created += 1;
+        const label = cleanText(pick(row, ['구분', '사용구분']), 30), map = { '오전 반차': 'AM_HALF', '오전반차': 'AM_HALF', '오후 반차': 'PM_HALF', '오후반차': 'PM_HALF', '반차': 'HALF_IMPORTED', '연차': 'FULL', '하루': 'FULL', '기간': 'FULL', '시간단위':'HOURLY', '시간 연차':'HOURLY' }; const type = map[label] || 'FULL'; const start = excelDate(pick(row, ['시작일', '사용일', '일자'])), end = excelDate(pick(row, ['종료일'])) || start; if (!parseIso(start) || !parseIso(end)) throw new Error('사용일 확인'); let days;let calc=null;
+        if(Object.hasOwn(row,'일수(정수)')||Object.hasOwn(row,'시간(나머지)'))days=minutesFromParts(pick(row,['일수(정수)'])||0,pick(row,['시간(나머지)'])||0)/DAY_MINUTES;
+        else days=Number(pick(row,['일수','사용일수']));
+        if(!Number.isFinite(days)||days<=0){calc=calculateLeave(s,u,type==='HALF_IMPORTED'?'AM_HALF':type,start,end,`${start}T${pick(row,['시작시간'])}`,`${end}T${pick(row,['종료시간'])}`);days=calc.days;}
+        if(days<=0||Math.round(days*DAY_MINUTES)%30!==0)throw new Error('사용량은 0보다 큰 0.5시간 단위여야 합니다.');
+        const importKey=`${u.id}|${type}|${start}|${end}|${Math.round(days*DAY_MINUTES)}|${pick(row,['시작시간'])}|${pick(row,['종료시간'])}`;
+        if(s.requests.some(r=>r.import_key===importKey)){result.skipped++;continue;}
+        const t = nowIso(), rec = { id: s.counters.request++, user_id: u.id, approver1_id: null, final_approver_id: null, leave_type: type, start_date: start, end_date: type.includes('HALF') ? start : end, import_key:importKey, start_time: calc?.start_time || cleanText(pick(row,['시작시간']),5), end_time: calc?.end_time || cleanText(pick(row,['종료시간']),5), charge_dates: calc?.charge_dates || null, days: Number(days), minutes:Math.round(Number(days)*DAY_MINUTES), reason: cleanText(pick(row, ['사유', '신청사유']) || 'Excel 업로드 이관', 500), status1: 'APPROVED', status_final: 'APPROVED', reject_reason: '', source: 'EXCEL_UPLOAD', source_note: cleanText(pick(row, ['자료설명', '비고']) || file.name, 300), created_at: t, updated_at: t, approved1_at: t, final_approved_at: t, cancelled_at: null }; s.requests.push(rec); result.usage_created += 1;
       } catch (e) { result.errors.push(`사용내역등록 ${row.rowNo}행: ${e.message}`); }
     }
     if (!wsUsers && !wsUsage) throw new HttpError(400, 'Excel에 “직원등록” 또는 “사용내역등록” 시트가 없습니다. 시스템의 업로드 양식을 사용해 주세요.');
@@ -987,3 +1076,5 @@ export default async function handler(request, context) {
 }
 
 export const config = { path: '/api/*' };
+
+export { handle, ensureStateShape, userSummary, calculateLeave, renewalRows, passwordHash };
