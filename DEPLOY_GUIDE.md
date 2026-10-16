@@ -1,6 +1,6 @@
 # 배포 안내
 
-v8.2 교체 절차는 **UPGRADE_v8_2.md**를 따르세요.
+v8.3 교체 절차는 **UPGRADE_v8_3.md**를 따르세요.
 
 기존 Netlify 프로젝트와 GitHub 저장소를 유지합니다.
 프로젝트 루트의 netlify.toml을 사용합니다.

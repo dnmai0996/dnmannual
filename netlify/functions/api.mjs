@@ -1,6 +1,7 @@
 import { getStore } from '@netlify/blobs';
 import Holidays from 'date-holidays';
 import ExcelJS from 'exceljs';
+import { comparePeople, sortPeople } from '../../public/org-sort.js';
 import { INITIAL_STATE } from './_lib/initial-state.js';
 import { ROSTER_2026 } from './_lib/roster-2026.js';
 import { DAY_MINUTES, parts, minutesFromParts, normalizeCharge, requestMinutesInRange, sumRequests, sumAdjustments, cycleBalance, cycleHistory, basisDate } from './_lib/balance.js';
@@ -15,8 +16,8 @@ const SESSION_SECONDS = 10 * 60 * 60;
 const DEFAULT_HASH = 'pbkdf2$100000$7a8e927109f2b5d4c8a18fd3418f9352$fcfbf0d30d90aefca3e450e6bee44a9e50b9e5f364e105d80db5b69b98d3a5ac';
 const ADMIN_HASH_0996 = 'pbkdf2$100000$4d47c197f9d5488c9daaa3960e20b273$4e3110edeabe1590d55a8ef78dea96877c6225d0f1e7c206e207f80a66cf20d5';
 const DEFAULT_WORK = { work_start: '08:30', lunch_start: '12:30', lunch_end: '13:30', work_end: '17:30' };
-const SCHEMA_VERSION = 10;
-const APP_VERSION = '8.2.0-dnm';
+const SCHEMA_VERSION = 11;
+const APP_VERSION = '8.3.0-dnm';
 const SYSTEM_ADMIN_LOGIN = 'admin';
 const REPRESENTATIVE_LOGIN = '대표이사';
 const RESERVED_LOGINS = new Set(['admin', '통합관리자', '관리자', '대표이사', '대표자']);
@@ -221,7 +222,7 @@ function ensureStateShape(s) {
     if (u.legacy_hidden == null) u.legacy_hidden = false;
     if (!u.is_system_account && isRetiredAsOf(u)) u.active = false;
   }
-  s.staff_audit ||= []; s.cycle_grants ||= [];
+  s.staff_audit ||= []; s.cycle_grants ||= []; s.test_clear_history ||= [];
   s.roster_history ||= structuredClone(ROSTER_2026.history);
   s.roster_source ||= {source_file:ROSTER_2026.source_file,source_as_of_text:ROSTER_2026.source_as_of_text,counts:ROSTER_2026.counts};
   for(const u of s.users){
@@ -265,7 +266,7 @@ async function initDb(env) {
   if (!existing) {
     const initial = ensureStateShape(structuredClone(INITIAL_STATE));
     initial.updated_at = nowIso();
-    await env.stateStore.setJSON('state', initial, { onlyIfNew: true, metadata: { schema: 'leave-manager-v8.2' } });
+    await env.stateStore.setJSON('state', initial, { onlyIfNew: true, metadata: { schema: 'leave-manager-v8.3' } });
   }
 }
 async function loadState(env) {
@@ -276,7 +277,7 @@ async function loadState(env) {
 async function saveState(env, version, state) {
   ensureStateShape(state);
   state.updated_at = nowIso();
-  const r = await env.stateStore.setJSON('state', state, { onlyIfMatch: version, metadata: { schema: 'leave-manager-v8.2', updated_at: state.updated_at } });
+  const r = await env.stateStore.setJSON('state', state, { onlyIfMatch: version, metadata: { schema: 'leave-manager-v8.3', updated_at: state.updated_at } });
   if (!r?.modified) throw new HttpError(409, '다른 사용자가 동시에 자료를 처리했습니다. 화면을 새로고침한 뒤 다시 시도해 주세요.');
 }
 async function createSession(env, token, userId, expiresAt) { await env.sessionStore.setJSON(token, { user_id: Number(userId), expires_at: Number(expiresAt) }, { metadata: { expires_at: Number(expiresAt) } }); }
@@ -371,13 +372,14 @@ function requestRow(s, r) {
     current_approval: current,
     company_id: a?.company_id ?? null, company_name: companyName(s, a?.company_id), department: a?.department || '',
     employee_code: a?.employee_code || '', applicant_name: a?.employee_name || '', applicant_login: a?.login_id || '',
+    position: a?.position || '', join_date: a?.join_date || '', is_representative: Boolean(a?.is_representative), is_system_account: Boolean(a?.is_system_account),
     approver1_name: f?.employee_name || '', approver1_login: f?.login_id || '',
     final_approver_name: z?.employee_name || '', final_approver_login: z?.login_id || '',
     hours, work_hours_per_day: workHoursPerDay
   };
 }
-function allRequestRows(s) { return s.requests.map((r) => requestRow(s, r)).sort((a, b) => String(b.start_date).localeCompare(String(a.start_date)) || b.id - a.id); }
-function sortUsers(s, users) { return [...users].sort((a, b) => companyName(s, a.company_id).localeCompare(companyName(s, b.company_id), 'ko') || (Number(a.is_system_account) - Number(b.is_system_account)) || String(a.department || '').localeCompare(String(b.department || ''), 'ko') || String(a.employee_name || '').localeCompare(String(b.employee_name || ''), 'ko') || String(a.login_id).localeCompare(String(b.login_id), 'ko')); }
+function allRequestRows(s) { return s.requests.map((r) => requestRow(s, r)).sort((a, b) => comparePeople(a, b) || String(b.start_date).localeCompare(String(a.start_date)) || b.id - a.id); }
+function sortUsers(s, users) { return sortPeople(users.map((u) => ({ ...u, company_name: companyName(s, u.company_id) }))); }
 function generateLoginId(s, name, excluded = null) {
   let base = normalizeLoginBase(name).normalize('NFKC');
   if (RESERVED_LOGINS.has(base)) base = `${base}2`;
@@ -568,7 +570,7 @@ function renewalRows(s,ym,companyId=null,asOf=todayIsoKst()) {
     prior_cycle_start:prev.cycle_start,prior_cycle_end:prev.cycle_end,prior_granted:prev.granted,prior_used:prev.used,prior_adjustments:prev.adjustments,prior_balance:prev.remaining,unused_expiring:unused/DAY_MINUTES,overused:over/DAY_MINUTES,new_entitlement:next.granted,new_cycle_start:next.cycle_start,new_cycle_end:next.cycle_end,
     amounts:{prior_granted:prev.amounts.granted,prior_used:prev.amounts.used,prior_adjustments:prev.amounts.adjustments,prior_balance:prev.amounts.remaining,unused_expiring:parts(unused),overused:parts(over),new_entitlement:next.amounts.granted},
     status:ad<asOf?'갱신완료':ad===asOf?'오늘 갱신':'갱신예정',settlement_due:ad<=asOf,settlement_status:'수당·소멸예외 별도확인',carryover_minutes:0};
- }).filter(Boolean).sort((a,b)=>a.anniversary_date.localeCompare(b.anniversary_date)||a.employee_name.localeCompare(b.employee_name,'ko'));
+ }).filter(Boolean).sort(comparePeople);
 }
 async function sessionUser(request, env, s) {
   const token = getCookie(request, 'leave.sid'); if (!token) return null;
@@ -657,7 +659,13 @@ async function rosterRoutes({request,env,s,version,url,pathname,method,body}) {
  const actor=await requireAdmin(request,env,s);
  if(method==='GET'&&pathname==='/api/roster') {
   const source=s.roster_source||{};
-  return json({employees:sortUsers(s,s.users.filter(x=>!x.is_system_account&&!x.deleted&&!x.legacy_hidden)).map(x=>staffRow(s,x)),history:s.roster_history||[],audit:[...(s.staff_audit||[])].reverse(),source});
+  const matchingPerson=(r)=>s.users.find((u)=>!u.is_system_account&&(u.employee_name===r.employee_name||u.id===r.employee_id));
+  const auditSorted=[...(s.staff_audit||[])].sort((a,b)=>{
+    const ua=matchingPerson(a)||{employee_name:a.employee_name,department:a.department,position:a.position,join_date:a.join_date};
+    const ub=matchingPerson(b)||{employee_name:b.employee_name,department:b.department,position:b.position,join_date:b.join_date};
+    return comparePeople(ua,ub)||String(b.at||'').localeCompare(String(a.at||''));
+  });
+  return json({employees:sortUsers(s,s.users.filter(x=>!x.is_system_account&&!x.deleted&&!x.legacy_hidden)).map(x=>staffRow(s,x)),history:sortPeople(s.roster_history||[]),audit:auditSorted,source});
  }
  if(method==='POST'&&pathname==='/api/roster/preview') {
   let source;
@@ -776,10 +784,10 @@ async function handle(context) {
   if (method === 'GET' && pathname === '/api/approvers') {
     const u = await requireAuth(request, env, s);
     if (u.company_id == null) return json({ first: [], representative: null });
-    const simp = (x) => ({ id: x.id, employee_name: x.employee_name, login_id: x.login_id, department: x.department || '', position: x.position || '' });
+    const simp = (x) => ({ id: x.id, employee_name: x.employee_name, login_id: x.login_id, department: x.department || '', position: x.position || '', join_date: x.join_date || '', is_representative: Boolean(x.is_representative), company_id:x.company_id });
     const first = s.users
       .filter((x) => x.company_id === u.company_id && userAvailable(x) && !x.is_system_account && x.id !== u.id && x.can_approve_first)
-      .sort((a, b) => a.employee_name.localeCompare(b.employee_name, 'ko'))
+      .sort(comparePeople)
       .map(simp);
     return json({ first, representative: null, final_mode: 'LAST_APPROVER' });
   }
@@ -849,7 +857,7 @@ async function handle(context) {
       if (!mine.length) return null;
       const last = mine[mine.length - 1];
       return { ...r, my_step: last, my_action: last.status, my_action_at: last.action_at, my_comment: last.comment || '' };
-    }).filter(Boolean).sort((a, b) => String(b.my_action_at || '').localeCompare(String(a.my_action_at || '')));
+    }).filter(Boolean).sort((a, b) => comparePeople(a,b) || String(b.my_action_at || '').localeCompare(String(a.my_action_at || '')));
     return json(rows);
   }
   p = matchPath(pathname, /^\/api\/requests\/(\d+)\/action$/);
@@ -1001,7 +1009,7 @@ async function handle(context) {
     const accounts = sortUsers(s, s.users.filter((u) => !u.deleted && !u.legacy_hidden && (u.is_system_account ? [SYSTEM_ADMIN_LOGIN, REPRESENTATIVE_LOGIN].includes(u.login_id) : employmentMatches(u, employment)) && (!cid || u.company_id === cid || u.company_id == null)));
     const userSummaries = selected.map((u) => userSummary(s, u)), accountSummaries = accounts.map((u) => userSummary(s, u)), ids = new Set(selected.map((u) => u.id));
     const requestRows = allRequestRows(s).filter((r) => ids.has(r.user_id));
-    const adjustmentRows = s.adjustments.filter((r) => ids.has(r.user_id)).sort((a, b) => b.id - a.id).map((r) => { const u = userById(s, r.user_id), m = userById(s, r.created_by); return { ...r, employee_name: u?.employee_name || '', login_id: u?.original_login_id || u?.login_id || '', company_name: companyName(s, u?.company_id), created_by_name: m?.employee_name || '' }; });
+    const adjustmentRows = s.adjustments.filter((r) => ids.has(r.user_id)).map((r) => { const u = userById(s, r.user_id), m = userById(s, r.created_by); return { ...r, employee_name: u?.employee_name || '', login_id: u?.original_login_id || u?.login_id || '', company_name: companyName(s, u?.company_id), department: u?.department || '', position: u?.position || '', join_date: u?.join_date || '', is_representative: Boolean(u?.is_representative), created_by_name: m?.employee_name || '' }; }).sort((a,b)=>comparePeople(a,b)||b.id-a.id);
     const companyNameValue = company?.name || '전체회사', asOf = todayIsoKst(), currentMonth = asOf.slice(0, 7), renewalRowsValue = renewalRows(s, currentMonth, cid, asOf);
     return json({ userSummaries, accountSummaries, requestRows, adjustmentRows, renewalRows: renewalRowsValue, workSettings: cid ? [getWorkSettings(s, cid)] : s.work_settings,
       customHolidays: s.custom_holidays, companyName: companyNameValue, employment, asOf });
@@ -1053,12 +1061,79 @@ async function handle(context) {
     await saveState(env, version, s); return json(result);
   }
 
+  // Do not leave a legacy endpoint that replaces the workforce, passwords and approvals
+  // with bundled seed data. All test cleanups use the backup-verified workflow below.
   if (method === 'POST' && pathname === '/api/admin/reset-initial') {
-    await requireSuperAdmin(request, env, s);
-    const reset = ensureStateShape(structuredClone(INITIAL_STATE));
-    reset.updated_at = nowIso();
-    await saveState(env, version, reset);
-    return json({ ok: true, employee_count: reset.users.filter((u) => !u.is_system_account && !u.deleted).length, seed_version: reset.seed_version });
+    await requireAdmin(request, env, s);
+    throw new HttpError(410, '전체 초기자료 재설정은 비활성화되었습니다. Excel·백업 → 테스트자료 일괄삭제를 이용해 직원명부를 보존해 주세요.');
+  }
+
+  if (method === 'GET' && pathname === '/api/admin/test-clear/preview') {
+    await requireAdmin(request, env, s);
+    return json({
+      count: { requests: s.requests.length, adjustments: s.adjustments.length, cycle_grants: s.cycle_grants.length },
+      retained: {
+        employees: s.users.filter((u) => !u.is_system_account && !u.deleted).length,
+        companies: s.companies.length, work_settings: s.work_settings.length,
+        holidays: s.custom_holidays.length, staff_audit: s.staff_audit.length
+      },
+      reset_history: (s.test_clear_history || []).slice(-5).reverse(),
+      note: '연차신청·결재와 사용내역 이관, 연차 가감조정만 기본 삭제합니다. 확정 발생량은 별도 선택 시 삭제하며 직원·계정·명부·근무시간·휴일은 보존합니다.'
+    });
+  }
+
+  if (method === 'POST' && pathname === '/api/admin/test-clear') {
+    const actor = await requireAdmin(request, env, s);
+    if (body.confirmation_phrase !== '테스트자료삭제' || body.confirm_data_loss !== true)
+      throw new HttpError(400, '삭제 확인 문구와 자료삭제 동의를 모두 입력해 주세요.');
+    if (!await verifyPassword(String(body.password || ''), actor.password_hash))
+      throw new HttpError(403, '관리자 본인 비밀번호가 일치하지 않습니다.');
+    const downloadedHash = String(body.backup_sha256 || '').toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(downloadedHash))
+      throw new HttpError(400, '반드시 운영자료 JSON 백업을 다운로드하여 다시 선택한 후 진행해 주세요.');
+    const serialized = JSON.stringify(s, null, 2);
+    const originalHash = hex(await crypto.subtle.digest('SHA-256', enc.encode(serialized)));
+    if (downloadedHash !== originalHash)
+      throw new HttpError(409, '검증한 백업파일이 현재 운영자료와 다릅니다. 새 JSON 백업을 받아 다시 확인해 주세요.');
+
+    const counts = { requests: s.requests.length, adjustments: s.adjustments.length, cycle_grants: s.cycle_grants.length };
+    const clearGrants = body.clear_cycle_grants === true;
+    if (!counts.requests && !counts.adjustments && !(clearGrants && counts.cycle_grants))
+      throw new HttpError(400, '선택한 삭제 대상에 데이터가 없습니다.');
+    // A second, site-scoped recovery copy is made BEFORE any destructive state change.
+    // The downloadable backup selected by the user is also independently retained.
+    if (!env.resetBackupStore || typeof env.resetBackupStore.setJSON !== 'function')
+      throw new HttpError(503, '서버 안전 백업 저장소를 이용할 수 없어 삭제 작업을 중단했습니다.');
+    const snapshotKey = `pre-test-clear-${nowIso().replace(/[:.]/g, '-')}-${randomHex(8)}`;
+    const recordedAt = nowIso();
+    const saved = await env.resetBackupStore.setJSON(snapshotKey, s, {
+      onlyIfNew: true,
+      metadata: { created_at: recordedAt, actor_id: actor.id, kind: 'pre-test-clear' }
+    });
+    if (!saved?.modified) throw new HttpError(503, '삭제 전 서버 안전 백업에 실패했습니다. 자료는 삭제되지 않았습니다.');
+    s.requests = [];
+    s.adjustments = [];
+    if (clearGrants) s.cycle_grants = [];
+    const audit = {
+      at: recordedAt, actor_id: actor.id, actor_name: actor.employee_name,
+      backup_key: snapshotKey, counts, cycle_grants_deleted: clearGrants, backup_sha256: originalHash
+    };
+    s.test_clear_history ||= [];
+    s.test_clear_history.push(audit);
+    await saveState(env, version, s);
+    return json({ ok: true, deleted: { requests: counts.requests, adjustments: counts.adjustments, cycle_grants: clearGrants ? counts.cycle_grants : 0 },
+      preserved: { employees: s.users.filter((u) => !u.is_system_account && !u.deleted).length, companies: s.companies.length },
+      backup_key: snapshotKey, completed_at: recordedAt });
+  }
+
+  if (method === 'GET' && pathname === '/api/admin/test-clear/recovery') {
+    await requireAdmin(request, env, s);
+    const key = cleanText(url.searchParams.get('key'), 140);
+    if (!(s.test_clear_history || []).some((r) => r.backup_key === key))
+      throw new HttpError(404, '서버 보관 백업을 찾을 수 없습니다.');
+    const snapshot = await env.resetBackupStore.get(key, { type: 'json', consistency: 'strong' });
+    if (!snapshot) throw new HttpError(404, '서버에 보관된 백업을 찾을 수 없습니다.');
+    return fileResponse(enc.encode(JSON.stringify(snapshot, null, 2)), 'application/json; charset=utf-8', `DNM_삭제전_서버백업_${key}.json`);
   }
 
   if (method === 'GET' && (pathname === '/api/admin/backup.json' || pathname === '/api/admin/backup.db')) { await requireAdmin(request, env, s); return fileResponse(enc.encode(JSON.stringify(s, null, 2)), 'application/json; charset=utf-8', `연차관리_자료백업_${todayIsoKst()}.json`); }
@@ -1070,7 +1145,11 @@ async function handle(context) {
 }
 
 export default async function handler(request, context) {
-  const env = { stateStore: getStore({ name: 'leave-manager-data', consistency: 'strong' }), sessionStore: getStore({ name: 'leave-manager-sessions', consistency: 'strong' }) };
+  const env = {
+    stateStore: getStore({ name: 'leave-manager-data', consistency: 'strong' }),
+    sessionStore: getStore({ name: 'leave-manager-sessions', consistency: 'strong' }),
+    resetBackupStore: getStore({ name: 'leave-manager-reset-backups', consistency: 'strong' })
+  };
   try { return await handle({ request, env }); }
   catch (error) { const status = error instanceof HttpError ? error.status : 500; if (status >= 500) console.error(error); return json({ error: error?.message || '서버 처리 중 오류가 발생했습니다.' }, status); }
 }

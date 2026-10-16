@@ -1,6 +1,6 @@
 {
   "name": "dnm-annual-leave-netlify",
-  "version": "8.2.0-dnm",
+  "version": "8.3.0-dnm",
   "private": true,
   "type": "module",
   "engines": {
@@ -13,7 +13,7 @@
   },
   "scripts": {
     "check": "node scripts/check.mjs",
-    "test": "node scripts/smoke-test.mjs && node --no-warnings --experimental-loader ./scripts/test-support/loader.mjs scripts/test-v82.mjs",
+    "test": "node scripts/smoke-test.mjs && node --no-warnings --experimental-loader ./scripts/test-support/loader.mjs scripts/test-v83.mjs",
     "dev:review": "node --no-warnings --experimental-loader ./scripts/test-support/loader.mjs scripts/dev-test-server.mjs"
   }
 }
