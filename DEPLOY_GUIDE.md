@@ -1,16 +1,15 @@
-# 배포 안내
+# DNM 연차관리 v8.4 배포 안내
 
-v8.3 교체 절차는 **UPGRADE_v8_3.md**를 따르세요.
+**기존 운영 중인 연차 Netlify 사이트 및 GitHub 저장소를 그대로 사용합니다.** MES 저장소는 수정하지 마십시오.
 
-기존 Netlify 프로젝트와 GitHub 저장소를 유지합니다.
-프로젝트 루트의 netlify.toml을 사용합니다.
+1. 기존 연차 사이트 **JSON 백업** 및 프로그램 ZIP/GitHub 커밋 보관.
+2. 기존 MES Supabase 프로젝트 SQL Editor에서 `database/01_install_leave.sql`과 `02_mes_sync.sql` 실행.
+3. **기존 연차 Netlify 사이트**에 `DNM_LEAVE_SUPABASE_URL`, `DNM_LEAVE_SUPABASE_SECRET_KEY` 서버 환경변수 등록. `DNM_LEAVE_STORAGE`는 아직 `blobs`.
+4. GitHub Desktop으로 전체 v8.4 파일 병합 → Commit/Push → Netlify 재배포. `public`/`netlify/functions`, Node 22.
+5. 연차관리 관리자 `Excel·백업` → JSON 다운로드 → 파일 재선택 → 데이터 이관·해시검증 완료. 이 단계에서 기존 Blobs 읽기 전용 동결.
+6. **마지막에** Netlify에 `DNM_LEAVE_STORAGE=supabase` 추가/변경하여 재배포. 로그인·이력·결재·백업을 검사.
+7. MES 자동연계는 작업자 테이블 구조 확인 후 **별도 활성화**해야 함. `03_check_mes_structure.sql` → `04_enable_mes_after_review_TEMPLATE.sql`.
 
-- Publish directory: `public`
-- Functions directory: `netlify/functions`
-- Node.js: 22
-- 기존 Netlify Blobs 운영 자료 유지
-- 서버 의존성 설치를 포함하는 GitHub 연동 배포 권장
-- 프로젝트 루트를 정적 공개 디렉터리로 지정하지 마세요.
+상세 초보자 매뉴얼: [`docs/설치_이관_사용안내.md`](docs/설치_이관_사용안내.md).
 
-Source: https://docs.netlify.com/build/data-and-storage/netlify-blobs/
-Netlify의 getStore는 사이트 범위 저장소이며 새 배포 후에도 자료를 유지합니다. 새 사이트는 별도 저장소입니다.
+⚠️ 동일 Netlify 사이트의 프로그램 교체와 실제 DB 이관은 **다른 단계**입니다. 데이터 이관 성공 전 저장소 설정을 `supabase`로 바꾸면 이전 자료가 로딩되지 않습니다.

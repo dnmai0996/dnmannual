@@ -1,3 +1,16 @@
+## v8.4.0-dnm — 2026-11-07
+
+- Existing MES Supabase project에 `dnm_leave_*` 별도 PostgreSQL 테이블 설치 (MES 기존 테이블 무수정).
+- Netlify Blobs 전체 JSON→Supabase 상태를 백업+ETag 원본잠금+SHA256 비교로 일회성 이관. 이전 서버 저장소 보존.
+- Supabase 분리 조회 테이블: employees/requests/adjustments/cycle_grants/staff_audit/roster_history/work_settings/custom_holidays/test_clear_history, hashed sessions, archives.
+- PostgreSQL revision CAS 트랜잭션으로 동시 쓰기 보호.
+- MES employee join/leave 안전 큐/설정 bridge; 실제 MES worker schema 확인 전 비활성, 이름/코드 중복은 보류, 이전 생산실적 삭제하지 않음.
+- 예정퇴사 도래 점검 Netlify 매일 Scheduled Function(09:10 KST).
+- 영업일 기준 과거 2일(주말/공휴일/회사휴무일 제외) 신청 허용, 서버와 신청 화면 적용.
+- 기존 41 test groups + 신규 9 test groups PASS (실운영 DB 검수 별도).
+
+### 이전 변경
+
 # v8.3.0-dnm (2026-10-17)
 
 - 직원 관련 목록의 공통 정렬: 임원 우선 → 부서 → 직책 → 입사일 → 이름.

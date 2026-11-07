@@ -1,4 +1,5 @@
 import { getStore } from '@netlify/blobs';
+import { createSupabaseBackend, snapshotHash, snapshotCounts } from './_lib/supabase-store.mjs';
 import Holidays from 'date-holidays';
 import ExcelJS from 'exceljs';
 import { comparePeople, sortPeople } from '../../public/org-sort.js';
@@ -17,7 +18,7 @@ const DEFAULT_HASH = 'pbkdf2$100000$7a8e927109f2b5d4c8a18fd3418f9352$fcfbf0d30d9
 const ADMIN_HASH_0996 = 'pbkdf2$100000$4d47c197f9d5488c9daaa3960e20b273$4e3110edeabe1590d55a8ef78dea96877c6225d0f1e7c206e207f80a66cf20d5';
 const DEFAULT_WORK = { work_start: '08:30', lunch_start: '12:30', lunch_end: '13:30', work_end: '17:30' };
 const SCHEMA_VERSION = 11;
-const APP_VERSION = '8.3.0-dnm';
+const APP_VERSION = '8.4.0-dnm';
 const SYSTEM_ADMIN_LOGIN = 'admin';
 const REPRESENTATIVE_LOGIN = '대표이사';
 const RESERVED_LOGINS = new Set(['admin', '통합관리자', '관리자', '대표이사', '대표자']);
@@ -262,6 +263,7 @@ function ensureStateShape(s) {
   return s;
 }
 async function initDb(env) {
+  if (env.storageMode === 'supabase') return; // Fail closed until live Blobs data was migrated.
   const existing = await env.stateStore.getWithMetadata('state', { consistency: 'strong', type: 'json' });
   if (!existing) {
     const initial = ensureStateShape(structuredClone(INITIAL_STATE));
@@ -275,6 +277,8 @@ async function loadState(env) {
   return { version: row.etag, state: ensureStateShape(row.data) };
 }
 async function saveState(env, version, state) {
+  if (env.storageMode === 'blobs' && state?.dnm_migration?.frozen)
+    throw new HttpError(423, 'Supabase 이관을 위해 기존 Netlify 자료가 읽기 전용으로 전환되었습니다. 운영 DB 전환을 완료해 주세요.');
   ensureStateShape(state);
   state.updated_at = nowIso();
   const r = await env.stateStore.setJSON('state', state, { onlyIfMatch: version, metadata: { schema: 'leave-manager-v8.3', updated_at: state.updated_at } });
@@ -484,6 +488,23 @@ function holidayRows(s, companyId, start, end) {
   }
   return [...map.values()].sort((x, y) => x.date.localeCompare(y.date));
 }
+// 한국 시간 오늘 기준으로 두 영업일 전까지 사후 연차 신청 허용.
+// Weekend + national/substitute holidays + company holidays are all excluded.
+function earliestRetroactiveLeaveDate(s, companyId, asOf = todayIsoKst(), businessDays = 2) {
+  if (!parseIso(asOf)) throw new Error('올바른 기준일이 아닙니다.');
+  let day = asOf;
+  let found = 0;
+  for (let scanned = 0; scanned < 370 && found < businessDays; scanned++) {
+    day = addDays(day, -1);
+    const weekday = new Date(`${day}T00:00:00Z`).getUTCDay();
+    if (weekday === 0 || weekday === 6) continue;
+    if (holidayRows(s, companyId, day, day).length > 0) continue;
+    found++;
+  }
+  if (found !== businessDays) throw new Error('영업일 기준 날짜를 계산하지 못했습니다.');
+  return day;
+}
+
 function workingDateDetails(s, companyId, start, end) {
   const holidays = holidayRows(s, companyId, start, end); const holidayMap = new Map(holidays.map((h) => [h.date, h]));
   const chargeDates = [], excluded = [];
@@ -745,7 +766,75 @@ async function handle(context) {
   await initDb(env); const { version, state: s } = await loadState(env);
   const url = new URL(request.url), pathname = url.pathname, method = request.method, body = await parseBody(request);
 
-  if (method === 'GET' && pathname === '/api/health') return json({ ok: true, service: 'dnm-annual-leave-manager', version: APP_VERSION, date: todayIsoKst(), storage: 'Netlify Blobs' });
+  if (method === 'GET' && pathname === '/api/health') return json({ ok: true, service: 'dnm-annual-leave-manager', version: APP_VERSION, date: todayIsoKst(), storage: env.storageMode === 'supabase' ? 'Supabase PostgreSQL' : 'Netlify Blobs' });
+  // Safe migration flow: copy the complete live Blobs state into the existing MES Supabase
+  // project. The source is frozen using ETag CAS before migration; all old writes then fail.
+  if (method === 'GET' && pathname === '/api/admin/migration/status') {
+    await requireAdmin(request, env, s);
+    return json({ storage: env.storageMode === 'supabase' ? 'Supabase PostgreSQL' : 'Netlify Blobs',
+      migrated: env.storageMode === 'supabase',
+      source_frozen: Boolean(s.dnm_migration?.frozen),
+      migration: s.dnm_migration || null,
+      supabase_keys_ready: Boolean(process.env.DNM_LEAVE_SUPABASE_URL && process.env.DNM_LEAVE_SUPABASE_SECRET_KEY),
+      counts: snapshotCounts(s) });
+  }
+  if (method === 'POST' && pathname === '/api/admin/migration/start') {
+    if (env.storageMode !== 'blobs') throw new HttpError(409, '현재 저장소는 이미 Supabase입니다. 이관을 다시 실행하지 마세요.');
+    const actor = await requireAdmin(request, env, s);
+    if (body.confirmation_phrase !== '연차DB이관' || !body.confirm_data_preservation)
+      throw new HttpError(400, '연차DB이관 확인 문구와 백업 보존 동의가 필요합니다.');
+    if (!await verifyPassword(String(body.password || ''), actor.password_hash))
+      throw new HttpError(403, '관리자 현재 비밀번호를 확인해 주세요.');
+    const suppliedHash = cleanText(body.backup_sha256,64).toLowerCase();
+    const unfrozenSnapshot = JSON.stringify(s, null, 2);
+    const originalHash = hex(await crypto.subtle.digest('SHA-256', enc.encode(unfrozenSnapshot)));
+    const allowedHashes = s.dnm_migration?.frozen ? [s.dnm_migration.backup_sha256, originalHash] : [originalHash];
+    if (!/^[a-f0-9]{64}$/.test(suppliedHash) || !allowedHashes.includes(suppliedHash))
+      throw new HttpError(409, '선택한 JSON 백업이 현재 운영자료와 다릅니다. 방금 받은 최신 백업으로 다시 검증해 주세요.');
+    const pg = await createSupabaseBackend(process.env);
+    const existing = await pg.stateStore.getWithMetadata('state');
+    if (!s.dnm_migration?.frozen && existing) throw new HttpError(409, 'Supabase 연차 상태 테이블에 이미 데이터가 있습니다. 기존 자료 보호를 위해 덮어쓰지 않습니다.');
+    if (!s.dnm_migration?.frozen) {
+      const archivedAt=nowIso();
+      const backupKey=`pre-supabase-migration-${archivedAt.replace(/[:.]/g,'-')}-${randomHex(8)}`;
+      const backed=await env.resetBackupStore.setJSON(backupKey,s,{onlyIfNew:true,
+        metadata:{kind:'pre-supabase-migration',created_at:archivedAt,actor_id:actor.id}});
+      if (!backed?.modified) throw new HttpError(503,'Supabase 이전 전 서버 보관 안전백업 생성에 실패했습니다.');
+      const frozen=structuredClone(s);
+      frozen.dnm_migration={frozen:true,frozen_at:archivedAt,backup_sha256:originalHash,
+        original_blobs_etag:version,backup_key:backupKey,source:'Netlify Blobs'};
+      const locked=await env.stateStore.setJSON('state',frozen,{onlyIfMatch:version,
+        metadata:{schema:'leave-manager-v8.4',migration:'frozen',updated_at:archivedAt}});
+      if (!locked?.modified) throw new HttpError(409,'이관 도중 다른 사용자가 변경했습니다. 최신 자료를 다시 백업해 주세요.');
+    }
+    const frozenRow=await env.stateStore.getWithMetadata('state',{consistency:'strong',type:'json'});
+    if (!frozenRow?.data?.dnm_migration?.frozen) throw new HttpError(503,'기존 운영자료 잠금 확인에 실패했습니다.');
+    const source=frozenRow.data;
+    const destination=existing || await (async()=>{
+      const write=await pg.stateStore.setJSON('state',source,{onlyIfNew:true});
+      if (!write?.modified) throw new HttpError(409,'Supabase에 기존 자료가 감지되었습니다. 데이터를 덮어쓰지 않았습니다.');
+      return pg.stateStore.getWithMetadata('state');
+    })();
+    if (!destination || (await snapshotHash(destination.data)) !== (await snapshotHash(source)))
+      throw new HttpError(503,'Supabase 원본 대비 전체 데이터 무결성 검증에 실패했습니다. 기존 Netlify 자료는 보존되어 있습니다.');
+    const archives=await pg.copyArchivesFromBlob(env.resetBackupStore);
+    return json({ok:true,source_frozen:true,migrated:true,storage_now:'Netlify Blobs (READ ONLY)',
+      storage_next:'Supabase PostgreSQL (after Netlify environment switch)',
+      counts:snapshotCounts(source),archives,revision:destination.etag,
+      message:'전체 데이터와 기존 서버 백업을 검증했습니다. Netlify 환경변수 DNM_LEAVE_STORAGE=supabase로 변경하고 사이트를 재배포하세요.'});
+  }
+  if (method === 'GET' && pathname === '/api/admin/mes-sync/status') {
+    await requireAdmin(request, env, s);
+    if (env.storageMode !== 'supabase') return json({active:false, message:'Supabase 전환 후 MES 작업자 연계상태를 확인할 수 있습니다.'});
+    return json(await env.pgBackend.mesStatus());
+  }
+  if (method === 'POST' && pathname === '/api/admin/mes-sync/retry') {
+    const actor=await requireAdmin(request, env, s);
+    if (env.storageMode !== 'supabase') throw new HttpError(409,'먼저 Supabase로 전환해야 합니다.');
+    if (!await verifyPassword(String(body.password||''),actor.password_hash)) throw new HttpError(403,'관리자 비밀번호를 확인해 주세요.');
+    return json(await env.pgBackend.mesRetry());
+  }
+
   if (method === 'GET' && pathname === '/api/initial-info') return json({ company_count: s.companies.filter((c) => c.active).length, employee_count: s.users.filter((u) => !u.is_system_account && !u.deleted && !hasRetireDate(u)).length, version: APP_VERSION });
 
   if (method === 'POST' && pathname === '/api/login') {
@@ -791,6 +880,12 @@ async function handle(context) {
       .map(simp);
     return json({ first, representative: null, final_mode: 'LAST_APPROVER' });
   }
+  if (method === 'GET' && pathname === '/api/leave-request-policy') {
+    const u = await requireAuth(request, env, s);
+    const today = todayIsoKst();
+    return json({ today, earliest_date: earliestRetroactiveLeaveDate(s, u.company_id, today, 2),
+      retroactive_business_days: 2, holiday_policy: '주말·국가공휴일·회사휴일 제외', message: '사용 후 신청은 오늘을 기준으로 2영업일 전까지 허용합니다.' });
+  }
   if (method === 'POST' && pathname === '/api/calculate-leave') {
     const u = await requireAuth(request, env, s); if (u.is_system_account || u.company_id == null) throw new HttpError(400, '직원 본인 계정만 계산할 수 있습니다.');
     const type = cleanText(body.leave_type, 30), start = cleanText(body.start_date, 10), end = cleanText(body.end_date || body.start_date, 10);
@@ -809,7 +904,8 @@ async function handle(context) {
     if (approverIds.length > 10) throw new HttpError(400, '승인자는 최대 10명까지 지정할 수 있습니다.');
     const requestedStartDate = type === 'HOURLY' ? (parseLocalDateTime(startDateTime)?.date || '') : start;
     if (!requestedStartDate) throw new HttpError(400, '신청 시작일 또는 시작일시를 확인해 주세요.');
-    if (requestedStartDate < todayIsoKst()) throw new HttpError(400, '지난 날짜는 새로 신청할 수 없습니다.');
+    const earliestDate = earliestRetroactiveLeaveDate(s, u.company_id, todayIsoKst(), 2);
+    if (requestedStartDate < earliestDate) throw new HttpError(400, `사후 연차 신청은 ${earliestDate}부터 가능합니다(오늘 기준 2영업일 전, 주말·공휴일·회사휴일 제외).`);
     const calc = calculateLeave(s, u, type, start, end, startDateTime, endDateTime); start = calc.start_date; end = calc.end_date;
     const approvers = approverIds.map((id) => userById(s, id));
     if (approvers.some((a) => !userAvailable(a) || a.is_system_account || a.company_id !== u.company_id || !a.can_approve_first)) throw new HttpError(400, '승인자는 관리자 메뉴에서 “연차 승인자”로 체크된 같은 회사 재직 직원만 선택할 수 있습니다.');
@@ -1145,15 +1241,20 @@ async function handle(context) {
 }
 
 export default async function handler(request, context) {
-  const env = {
-    stateStore: getStore({ name: 'leave-manager-data', consistency: 'strong' }),
-    sessionStore: getStore({ name: 'leave-manager-sessions', consistency: 'strong' }),
-    resetBackupStore: getStore({ name: 'leave-manager-reset-backups', consistency: 'strong' })
-  };
-  try { return await handle({ request, env }); }
+  try {
+    const storageMode = process.env.DNM_LEAVE_STORAGE === 'supabase' ? 'supabase' : 'blobs';
+    const pgBackend = storageMode === 'supabase' ? await createSupabaseBackend(process.env) : null;
+    const env = {
+      storageMode, pgBackend,
+      stateStore: pgBackend?.stateStore || getStore({ name: 'leave-manager-data', consistency: 'strong' }),
+      sessionStore: pgBackend?.sessionStore || getStore({ name: 'leave-manager-sessions', consistency: 'strong' }),
+      resetBackupStore: pgBackend?.resetBackupStore || getStore({ name: 'leave-manager-reset-backups', consistency: 'strong' })
+    };
+    return await handle({ request, env });
+  }
   catch (error) { const status = error instanceof HttpError ? error.status : 500; if (status >= 500) console.error(error); return json({ error: error?.message || '서버 처리 중 오류가 발생했습니다.' }, status); }
 }
 
 export const config = { path: '/api/*' };
 
-export { handle, ensureStateShape, userSummary, calculateLeave, renewalRows, passwordHash };
+export { handle, ensureStateShape, userSummary, calculateLeave, renewalRows, passwordHash, earliestRetroactiveLeaveDate };
