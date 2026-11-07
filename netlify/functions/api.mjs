@@ -18,7 +18,7 @@ const DEFAULT_HASH = 'pbkdf2$100000$7a8e927109f2b5d4c8a18fd3418f9352$fcfbf0d30d9
 const ADMIN_HASH_0996 = 'pbkdf2$100000$4d47c197f9d5488c9daaa3960e20b273$4e3110edeabe1590d55a8ef78dea96877c6225d0f1e7c206e207f80a66cf20d5';
 const DEFAULT_WORK = { work_start: '08:30', lunch_start: '12:30', lunch_end: '13:30', work_end: '17:30' };
 const SCHEMA_VERSION = 11;
-const APP_VERSION = '8.4.0-dnm';
+const APP_VERSION = '8.5.0-dnm';
 const SYSTEM_ADMIN_LOGIN = 'admin';
 const REPRESENTATIVE_LOGIN = '대표이사';
 const RESERVED_LOGINS = new Set(['admin', '통합관리자', '관리자', '대표이사', '대표자']);
@@ -835,6 +835,40 @@ async function handle(context) {
     return json(await env.pgBackend.mesRetry());
   }
 
+  if (method === 'GET' && pathname === '/api/login-options') {
+    // Public sign-in helper: only the minimal identity label needed to distinguish
+    // namesakes; no employee codes, hire dates, email, phone, roles or passwords.
+    const query=loginKey(url.searchParams.get('name'));
+    if(query.length<2||query.length>40)return json({options:[]});
+    const strip=(v)=>loginKey(v).replace(/\s*\([^)]*\)\s*$/,'').replace(/\s+/g,'');
+    const stem=strip(query),matched=s.users.filter(u=>!u.deleted&&!u.legacy_hidden&&!u.is_system_account&&userAvailable(u)&&(
+      strip(u.employee_name).includes(stem)||loginKey(u.login_id).includes(query)))
+      .sort((a,b)=>String(a.employee_name).localeCompare(String(b.employee_name),'ko')||a.id-b.id)
+      .slice(0,10).map(u=>({login_id:u.login_id,employee_name:u.employee_name,
+        department:u.department||'',label:u.employee_name===u.login_id?'본인 계정':`로그인 ID: ${u.login_id}`}));
+    return json({options:matched});
+  }
+  if (method === 'GET' && pathname === '/api/admin/mes-link/preview') {
+    await requireAdmin(request,env,s);
+    if(env.storageMode!=='supabase')throw new HttpError(409,'Supabase 전환 후 사용할 수 있습니다.');
+    const rows=await env.pgBackend.mesLinkPreview();
+    return json({revision:version,ready:rows.filter(r=>r.decision==='ready').length,
+      linked:rows.filter(r=>r.decision==='linked').length,
+      review:rows.filter(r=>!['linked','ready'].includes(r.decision)).length,rows});
+  }
+  if (method === 'POST' && pathname === '/api/admin/mes-link/apply') {
+    const admin=await requireSuperAdmin(request,env,s);
+    if(env.storageMode!=='supabase')throw new HttpError(409,'Supabase 전환이 필요합니다.');
+    if(String(body.confirmation_phrase||'')!=='MES사번연결'||body.backup_ack!==true)
+      throw new HttpError(400,'확인 문구 MES사번연결 및 운영자료 백업 동의가 필요합니다.');
+    if(!await verifyPassword(String(body.password||''),admin.password_hash))
+      throw new HttpError(403,'현재 관리자 비밀번호를 확인해 주세요.');
+    if(String(body.expected_revision||'')!==version)
+      throw new HttpError(409,'미리보기 이후 직원정보가 변경되었습니다. 다시 확인해 주세요.');
+    const result=await env.pgBackend.mesApplyLinks(version,Boolean(body.enable_sync));
+    if(!result.modified)throw new HttpError(409,'동시 수정이 감지되었습니다. 다시 미리보기를 실행하세요.');
+    return json(result);
+  }
   if (method === 'GET' && pathname === '/api/initial-info') return json({ company_count: s.companies.filter((c) => c.active).length, employee_count: s.users.filter((u) => !u.is_system_account && !u.deleted && !hasRetireDate(u)).length, version: APP_VERSION });
 
   if (method === 'POST' && pathname === '/api/login') {
@@ -1033,6 +1067,8 @@ async function handle(context) {
     if (!name || !login || !parseIso(join)) throw new HttpError(400, '직원명, 로그인 ID, 입사일은 필수입니다.');
     if (retire && (!parseIso(retire) || retire < join)) throw new HttpError(400, '퇴사일은 입사일 이후 날짜로 입력해 주세요.');
     if (RESERVED_LOGINS.has(login)) throw new HttpError(400, '통합관리자/대표이사 전용 로그인 ID는 직원에게 사용할 수 없습니다.');
+    if(u.mes_record_id && cleanText(body.employee_code,40)!==cleanText(u.employee_code,40))
+      throw new HttpError(400,'MES 작업자와 연결된 사원번호는 여기에서 수정할 수 없습니다. 사원번호 변경은 연계 관리자 확인이 필요합니다.');
     if (s.users.some((x) => !x.deleted && !x.legacy_hidden && loginKey(x.login_id) === login && x.id !== u.id)) throw new HttpError(400, '이미 사용 중인 로그인 ID입니다.');
     const retiredNow = Boolean(retire && retire <= todayIsoKst()), requestedActive = body.active == null ? u.active : boolValue(body.active), newActive = retiredNow ? false : requestedActive;
     const wasAvailableApprover = userAvailable(u) && u.can_approve_first;
@@ -1132,7 +1168,7 @@ async function handle(context) {
             deleted: false, legacy_hidden: false, must_change_password: true, source_accrued: null, source_used: null, source_remaining: null, created_at: t, updated_at: t };
           s.users.push(u); result.users_created += 1;
         } else {
-          Object.assign(u, { company_id: cid, employee_code: cleanText(pick(row, ['사원코드', '사번']) || u.employee_code, 40), employee_name: name,
+          Object.assign(u, { company_id: cid, employee_code: u.mes_record_id ? u.employee_code : cleanText(pick(row, ['사원코드', '사번']) || u.employee_code, 40), employee_name: name,
             department: cleanText(pick(row, ['부서']) || u.department, 100), position: cleanText(pick(row, ['직급', '직책']) || u.position, 100), join_date: join, retire_date: retire || '',
             is_admin: Boolean(u.is_admin), can_approve_first: pick(row, ['승인자','연차 승인자'])==='' ? Boolean(u.can_approve_first) : boolValue(pick(row,['승인자','연차 승인자'])), can_approve_final: Boolean(u.can_approve_final), is_representative: Boolean(u.is_representative),
             active: retire && retire <= todayIsoKst() ? false : u.active, updated_at: nowIso() }); result.users_updated += 1;

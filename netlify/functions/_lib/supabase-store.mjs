@@ -101,10 +101,21 @@ export function buildSupabaseBackend(client) {
     const events = assertOk(await client.from('dnm_leave_mes_outbox').select('id,leave_employee_id,employee_code,event_type,status,last_error,attempts,created_at').order('id',{ascending:false}).limit(80), 'MES 연계 이력 조회');
     return { config, recent_events: events || [] };
   }
+  async function mesLinkPreview() {
+    return assertOk(await client.rpc('dnm_leave_mes_link_preview'),
+      'MES 직원 일치 후보 조회 (SQL 06_v85_mes_json_bridge.sql 설치 확인)') || [];
+  }
+  async function mesApplyLinks(revision, enableSync=false) {
+    const m=/^pg:(\d+)$/.exec(String(revision));
+    if(!m)throw new Error('Supabase 직원정보 버전을 확인해 주세요.');
+    return assertOk(await client.rpc('dnm_leave_mes_apply_links',{
+      p_expected_revision:Number(m[1]),p_enable_sync:Boolean(enableSync)
+    }),'MES 사원번호 연결 (SQL 06_v85_mes_json_bridge.sql 설치 확인)');
+  }
   async function mesRetry() {
     return assertOk(await client.rpc('dnm_leave_process_mes_sync', { p_limit: 100 }), 'MES 연계 재시도');
   }
-  return { stateStore, sessionStore, resetBackupStore, copyArchivesFromBlob, mesStatus, mesRetry, client };
+  return { stateStore, sessionStore, resetBackupStore, copyArchivesFromBlob, mesStatus, mesRetry, mesLinkPreview, mesApplyLinks, client };
 }
 
 export async function createSupabaseBackend(env = process.env) {
@@ -115,7 +126,7 @@ export async function createSupabaseBackend(env = process.env) {
   const { createClient } = await import('@supabase/supabase-js');
   const client = createClient(url.replace(/\/$/,''), secret, {
     auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
-    global: { headers: { 'X-Client-Info': 'dnm-leave-server-v8.4' } }
+    global: { headers: { 'X-Client-Info': 'dnm-leave-server-v8.5' } }
   });
   return buildSupabaseBackend(client);
 }

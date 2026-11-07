@@ -1,0 +1,47 @@
+(주)디엔엠 연차관리 v8.5 — 비전문가용 설치 순서
+작성 기준: 기존 연차관리 v8.4가 이미 Supabase PostgreSQL로 전환된 상태.
+기존 직원·연차·결재 자료는 삭제·재이관하지 않습니다.
+
+[사전] 이미 받아 두신 연차관리 JSON 백업을 PC에 보관하고, MES 작업자 DB 백업도 준비합니다.
+
+1단계: Supabase에서 SQL 한 번 실행
+  ① 기존 MES 프로젝트 dnmai0996's Project 접속 → 왼쪽 SQL Editor → New query
+  ② ZIP 안의 database/06_v85_mes_json_bridge.sql 전체 복사 → 붙여넣기 → Run
+  ③ 이 단계는 직원 사번을 바꾸지 않고 MES 연계도 활성화하지 않습니다.
+  ※ 01_install_leave.sql, 02_mes_sync.sql, Blobs 이관은 이미 마쳤으므로 다시 실행하지 않습니다.
+
+2단계: 기존 연차관리 사이트 v8.5로 업데이트
+  ① ZIP 압축 해제
+  ② 기존 연차관리 GitHub Desktop 프로젝트 폴더에 ZIP 안의 파일/폴더를 병합하여 덮어씁니다.
+     (.git 폴더나 기존 프로젝트 자체를 삭제하지 마세요.)
+  ③ GitHub Desktop → Commit to main → Push origin
+  ④ Netlify에서 기존 dnmannual 사이트 Deploy 성공 확인
+  ⑤ https://dnmannual.netlify.app/api/health 에서 version=8.5.0-dnm 확인
+  ※ Netlify 환경변수 DNM_LEAVE_STORAGE=supabase 등 기존 3개 설정은 건드리지 마세요.
+
+3단계: 로그인/정렬 시험 후 MES 연결
+  ① 로그인 화면에 '이상훈' 입력 → '이상훈', '이상훈 (2공장)'이 서로 다른 계정으로 표시되는지 확인
+  ② 관리자 대시보드나 근로자명부에서 표 머리글 클릭 → 정렬 방향 변경 확인
+  ③ 관리자 → Excel·백업 → 'MES 사원번호 연결 후보 확인' 버튼
+  ④ 목록에서 이름과 입사일이 맞는 사람만 '연결 가능'인지 확인
+  ⑤ 운영자료 최신 JSON 및 MES DB 백업 후, 확인 문구 MES사번연결 + 관리자 비밀번호 입력
+  ⑥ 첫 연결에서는 '이후 신규직원/퇴사 자동연계 사용' 체크를 해제하고 연결만 적용하는 것이 안전합니다.
+  ⑦ 기존 직원의 연차 신청·결재·잔여가 유지되는지 검증
+  ⑧ 충분히 확인한 후 동일 메뉴로 돌아가 연계 활성화를 추가 진행할 수 있습니다.
+  ※ 이상훈(품질팀 2023-07-17)은 2공장 이상훈(2016-11-07)과 다른 직원입니다. 자동 병합 금지.
+  ※ 김정배 사용중 대표이사와 미사용 임원 기록은 다릅니다.
+
+김정배 미사용 계정:
+  database/07_optional_inactive_kim_cleanup.sql은 사용자가 별도로 실행할 경우에만 삭제됩니다.
+  이전 생산실적 등 다른 테이블의 참조를 검사하고, 미사용 record 스냅샷을 전용 보관 테이블에 저장한 뒤
+  삭제하도록 되어 있습니다. 참조가 있으면 오류로 중단합니다. 초기 설치 시에는 실행하지 마세요.
+
+적용 후 확인:
+  database/08_verify_mes_links.sql을 SQL Editor에서 실행하면 연결/오류/검토대기 건수를 확인합니다.
+  MES 새 작업자 등록 시 기준정보만 등록하며 MES 로그인 계정 발급·권한은 기존 MES 관리 화면에서 검증합니다.
+
+복구 주의:
+  운영 중인 Netlify Blobs 자료를 다시 업로드하거나 Supabase 테이블을 초기화하지 마세요.
+  변경 전 JSON 백업을 보관하고, 예상과 다른 연결이 발생하면 즉시 MES 연계를 비활성화하세요:
+  UPDATE public.dnm_leave_mes_config SET enabled=false WHERE id=1;
+  데이터 복원 여부는 이력과 현재 변경 건수를 비교한 후 결정합니다.

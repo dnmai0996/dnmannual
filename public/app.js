@@ -45,19 +45,71 @@ app.addEventListener('click',event=>{
 });
 async function task(button,fn){if(button)button.disabled=true;try{await fn();}catch(e){toast(e.message,true);}finally{if(button)button.disabled=false;}}
 function empty(cols,text='조회 내역이 없습니다.'){return `<tr><td class="empty" colspan="${cols}">${esc(text)}</td></tr>`;}
-function table(head,body){return `<div class="table-wrap"><table><thead><tr>${head.map(t=>`<th>${esc(t)}</th>`).join('')}</tr></thead><tbody>${body||empty(head.length)}</tbody></table></div>`;}
+const sortCollator = new Intl.Collator('ko-KR', {numeric:true, sensitivity:'base'});
+function sortValue(cell){
+ const raw=(cell?.innerText||cell?.textContent||'').replace(/\s+/g,' ').trim();
+ if (!raw || raw === '-') return {type:'empty',value:''};
+ const duration=/^(?:초과\s*)?(\d+)일\s*(\d+(?:\.\d+)?)시간/.exec(raw);
+ if(duration)return {type:'number',value:Number(duration[1])*480+Number(duration[2])*60*(raw.startsWith('초과')?-1:1)};
+ const numeric=/^-?\d+(?:,\d{3})*(?:\.\d+)?(?:명|건|회|개)?$/.exec(raw);
+ if(numeric)return {type:'number',value:Number(raw.replace(/[,명건회개]/g,''))};
+ const date=/^(\d{4}-\d{2}-\d{2})(?:\s|$)/.exec(raw);
+ if(date)return {type:'date',value:date[1]};
+ return {type:'text',value:raw};
+}
+function table(head,body){return `<div class="table-wrap"><table class="data-sortable"><thead><tr>${head.map((t,i)=>{
+ const disabled = /^(관리|확인|작업|선택|처리|버튼|삭제)$/.test(String(t).trim());
+ return disabled ? `<th scope="col">${esc(t)}</th>` : `<th scope="col" aria-sort="none"><button type="button" class="sort-header" data-sort-col="${i}" title="${esc(t)} 기준 정렬">${esc(t)} <span class="sort-indicator" aria-hidden="true">↕</span></button></th>`;
+}).join('')}</tr></thead><tbody>${body||empty(head.length)}</tbody></table></div>`;}
+function handleTableSort(event){
+ const button=event.target.closest('button[data-sort-col]');
+ if(!button||!(app.contains(button)||modal.contains(button)))return;
+ const tbl=button.closest('table'),body=tbl?.tBodies?.[0];if(!body)return;
+ const rows=[...body.rows];if(rows.length<2 || rows.some(r=>r.querySelector('td.empty')))return;
+ const col=Number(button.dataset.sortCol),dir=button.closest('th').getAttribute('aria-sort')==='ascending'?'descending':'ascending';
+ rows.sort((a,b)=>{const x=sortValue(a.cells[col]),y=sortValue(b.cells[col]);if(x.type==='empty')return 1;if(y.type==='empty')return -1;
+ const comparison=x.type===y.type&&x.type==='number' ? x.value-y.value : sortCollator.compare(String(x.value),String(y.value));
+ return dir==='ascending'?comparison:-comparison;});
+ body.append(...rows);
+ tbl.querySelectorAll('thead th[aria-sort]').forEach(th=>{th.setAttribute('aria-sort','none');const ind=th.querySelector('.sort-indicator');if(ind)ind.textContent='↕';});
+ button.closest('th').setAttribute('aria-sort',dir);button.querySelector('.sort-indicator').textContent=dir==='ascending'?'▲':'▼';
+}
+app.addEventListener('click',handleTableSort);modal.addEventListener('click',handleTableSort);
 function stats(items){return `<div class="stats">${items.map(([label,value,sub],i)=>`<div class="stat ${i===items.length-1?'primary':''}"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(sub||'')}</small></div>`).join('')}</div>`;}
 function showError(e){$('#page').innerHTML=notice(esc(e.message),'danger');}
-async function loginPage(){me=null;app.innerHTML=`<main class="login-shell"><section class="login-intro"><img class="login-logo" src="/assets/dnm-logo.png" alt="(주)디엔엠 로고"><div class="eyebrow">DNM · ANNUAL LEAVE</div><h1>연차를 더 명확하게.<br>직원을 더 세심하게.</h1><p>입사일 기준 연차와 30분 단위 사용을<br>하나의 장부에서 관리합니다.</p><div class="login-features"><span>정수 일수 + 시간</span><span>선택형 순차 결재</span><span>근로자명부 관리</span></div></section><section class="login-panel"><form id="login-form" class="login-card"><img class="mobile-logo" src="/assets/dnm-logo.png" alt="(주)디엔엠"><div class="eyebrow">WELCOME TO DNM</div><h2>디엔엠 연차관리</h2><p class="muted">발급받은 직원 계정으로 로그인해 주세요.</p>${field('로그인 ID','login-id','','text','autocomplete="username" required')}${field('비밀번호','login-password','','password','autocomplete="current-password" required')}<button class="btn login-submit" type="submit">로그인</button><button type="button" class="btn ghost login-help" data-help="login">❔ 로그인 도움말</button><p class="small muted">계정 문의는 사내 관리자에게 해 주세요.<br>운영자료는 관리자 설정에 따라 Netlify 또는 Supabase DB에 저장됩니다.</p><div class="version">v8.4 · 1일 = 8시간 · 30분 = 0.5시간</div></form></section></main>`;
- $('#login-form').onsubmit=e=>{e.preventDefault();task($('button[type=submit]',e.currentTarget),async()=>{me=await api('/api/login',{method:'POST',body:{login_id:$('#login-id').value.trim(),password:$('#login-password').value}});currentPage=me.must_change_password?'password':'dashboard';await shell();});};}
+async function loginPage(){
+ me=null;
+ app.innerHTML=`<main class="login-shell"><section class="login-intro"><img class="login-logo" src="/assets/dnm-logo.png" alt="(주)디엔엠 로고"><div class="eyebrow">DNM · ANNUAL LEAVE</div><h1>연차를 더 명확하게.<br>직원을 더 세심하게.</h1><p>입사일 기준 연차와 30분 단위 사용을<br>하나의 장부에서 관리합니다.</p><div class="login-features"><span>정수 일수 + 시간</span><span>선택형 순차 결재</span><span>근로자명부 관리</span></div></section><section class="login-panel"><form id="login-form" class="login-card"><img class="mobile-logo" src="/assets/dnm-logo.png" alt="(주)디엔엠"><div class="eyebrow">WELCOME TO DNM</div><h2>디엔엠 연차관리</h2><p class="muted">이름을 입력하고 목록에서 본인 계정을 선택해 주세요. 기존 로그인 ID도 사용할 수 있습니다.</p><div class="login-name-box">${field('이름 또는 로그인 ID','login-id','','text','autocomplete="username" required aria-controls="login-suggestions" aria-expanded="false"')}<div id="login-suggestions" class="login-suggestions hidden" role="listbox" aria-label="일치하는 직원 로그인 계정"></div></div>${field('비밀번호','login-password','','password','autocomplete="current-password" required')}<button class="btn login-submit" type="submit">로그인</button><button type="button" class="btn ghost login-help" data-help="login">❔ 로그인 도움말</button><p class="small muted">같은 이름의 직원은 부서·공장정보를 확인한 후 선택하세요.<br>계정 문의는 사내 관리자에게 해 주세요.</p><div class="version">v8.5 · 1일 = 8시간 · 30분 = 0.5시간</div></form></section></main>`;
+ const input=$('#login-id'),list=$('#login-suggestions');let seq=0,delay;
+ const hide=()=>{list.classList.add('hidden');input.setAttribute('aria-expanded','false');};
+ input.addEventListener('input',()=>{
+   const q=input.value.trim();seq++;clearTimeout(delay);hide();if(q.length<2)return;
+   const stamp=seq;
+   delay=setTimeout(async()=>{
+     try{
+       const result=await api(`/api/login-options?name=${encodeURIComponent(q)}`);
+       if(stamp!==seq||input.value.trim()!==q)return;
+       const names=result.options||[];
+       if(!names.length)return;
+       list.innerHTML=names.map((u,i)=>`<button type="button" role="option" class="login-option" data-login-option="${i}" aria-label="${esc(u.label)}"><strong>${esc(u.employee_name)}</strong><small>${esc(u.department||'부서 미지정')} · ${esc(u.label)}</small></button>`).join('');
+       list.classList.remove('hidden');input.setAttribute('aria-expanded','true');
+       list.querySelectorAll('[data-login-option]').forEach(btn=>btn.onclick=()=>{input.value=names[Number(btn.dataset.loginOption)].login_id;seq++;hide();$('#login-password').focus();});
+     }catch{hide();}
+   },180);
+ });
+ input.addEventListener('keydown',e=>{if(e.key==='Escape')hide();if(e.key==='ArrowDown'&&!list.classList.contains('hidden')){e.preventDefault();list.querySelector('button')?.focus();}});
+ list.addEventListener('keydown',e=>{if(e.key==='Escape'){hide();input.focus();}});
+ input.addEventListener('blur',()=>setTimeout(hide,200));
+ $('#login-form').onsubmit=e=>{e.preventDefault();task($('button[type=submit]',e.currentTarget),async()=>{me=await api('/api/login',{method:'POST',body:{login_id:input.value.trim(),password:$('#login-password').value}});currentPage=me.must_change_password?'password':'dashboard';await shell();});};
+}
 async function shell(){me=await api('/api/me');companies=me.can_manage?await api('/api/companies'):[];const nav=[['dashboard','⌂','대시보드']];if(!me.is_system_account)nav.push(['apply','✎','연차 신청'],['history','▤','나의 신청내역'],['ledger','◷','나의 연차대장']);if(me.can_approve_first||me.can_manage)nav.push(['approvals','✓','결재함']);if(me.can_manage)nav.push(['employees','♙','근로자명부'],['manage','▦','연차 통합관리'],['standards','⚙','근무·휴일 기준'],['backup','⇅','Excel·백업']);nav.push(['password','●','비밀번호 변경']);
- app.innerHTML=`<header class="app-header"><a href="#" class="brand"><img src="/assets/dnm-logo.png" alt="(주)디엔엠 로고"><div><h1>디엔엠 연차관리</h1><small>직원 · 결재 · 연차 통합관리</small></div></a><div class="user-tools"><div><strong>${esc(me.employee_name)}</strong><small>${esc(me.role_label)}</small></div><button class="btn ghost small" id="logout">로그아웃</button></div></header><div class="app-layout"><aside class="sidebar"><nav>${nav.map(([id,icon,label])=>`<button data-nav="${id}"><span>${icon}</span>${label}</button>`).join('')}</nav><div class="sidebar-note">1일 <b>8시간</b><br>30분 <b>0.5시간</b><hr>입사기념일 새 주기<br>이전 잔여 이월 없음<small>v8.4.0 DNM</small></div></aside><main id="page"></main></div>`;
+ app.innerHTML=`<header class="app-header"><a href="#" class="brand"><img src="/assets/dnm-logo.png" alt="(주)디엔엠 로고"><div><h1>디엔엠 연차관리</h1><small>직원 · 결재 · 연차 통합관리</small></div></a><div class="user-tools"><div><strong>${esc(me.employee_name)}</strong><small>${esc(me.role_label)}</small></div><button class="btn ghost small" id="logout">로그아웃</button></div></header><div class="app-layout"><aside class="sidebar"><nav>${nav.map(([id,icon,label])=>`<button data-nav="${id}"><span>${icon}</span>${label}</button>`).join('')}</nav><div class="sidebar-note">1일 <b>8시간</b><br>30분 <b>0.5시간</b><hr>입사기념일 새 주기<br>이전 잔여 이월 없음<small>v8.5.0 DNM</small></div></aside><main id="page"></main></div>`;
  $('#logout').onclick=e=>task(e.currentTarget,async()=>{await api('/api/logout',{method:'POST'});generation++;await loginPage();});$$('[data-nav]').forEach(b=>b.onclick=()=>go(b.dataset.nav));$('.brand').onclick=e=>{e.preventDefault();go('dashboard');};if(!nav.some(x=>x[0]===currentPage))currentPage='dashboard';await go(currentPage);}
 async function go(page){currentPage=page;const id=++generation;$$('[data-nav]').forEach(b=>b.classList.toggle('active',b.dataset.nav===page));$('#page').innerHTML='<div class="loading">자료를 불러오고 있습니다…</div>';try{await ({dashboard,apply,history,ledger,approvals,employees,manage,standards,backup,password})[page](id);}catch(e){if(id===generation)showError(e);}window.scrollTo({top:0});}
 function alive(id){return id===generation;}
 async function dashboard(id){me=await api('/api/me');if(!alive(id))return;
  if(me.can_manage){const [users,st]=await Promise.all([api('/api/users?employment=all'),api('/api/admin/stats')]);if(!alive(id))return;const active=sortPeople(users.filter(u=>u.employment_status==='재직')),remain=active.reduce((a,u)=>a+u.amounts.remaining.minutes,0);
- $('#page').innerHTML=pageHead('관리자 대시보드','직원별 연차주기와 신청·결재 현황을 함께 확인합니다.',`<button class="btn" id="roster-link">근로자명부</button>`)+stats([['재직자',`${active.length}명`,'퇴사자 별도 보관'],['결재대기',`${st.pending_count}건`,'현재 미처리 신청'],['금년 승인 사용',quantity(st.approved_this_year),'올해에 귀속된 사용량'],['직원별 현재 잔여 합계',quantity({minutes:remain}),'각 직원의 현재 연차주기 기준']])+notice('입사기념일이 되면 이전 주기의 미사용 잔여는 <b>이월하지 않고</b> 새 발생량을 적용합니다. 기존 사용·결재 이력은 유지합니다.')+`<section class="card"><h3>직원별 현재 연차</h3>${table(['직원 / 부서','연차기준일','현재 사용기간','발생','사용','대기','잔여','확인'],active.map(u=>`<tr><td><strong>${esc(u.employee_name)}</strong><small>${esc(u.department)}</small></td><td>${esc(u.leave_basis_date)}</td><td>${esc(u.cycle_start)}<br>~ ${esc(u.cycle_end)}</td><td class="amount">${bal(u,'granted')}</td><td class="amount">${bal(u,'used')}</td><td class="amount">${bal(u,'pending')}</td><td class="amount ${u.remaining<0?'negative':''}">${bal(u,'remaining')}</td><td><button class="btn ghost small" data-ledger="${u.id}">연차대장</button></td></tr>`).join(''))}</section>`;$('#roster-link').onclick=()=>go('employees');$$('[data-ledger]').forEach(b=>b.onclick=()=>ledgerModal(Number(b.dataset.ledger)));return;}
+ $('#page').innerHTML=pageHead('관리자 대시보드','직원별 연차주기와 신청·결재 현황을 함께 확인합니다.',`<button class="btn" id="roster-link">근로자명부</button>`)+stats([['재직자',`${active.length}명`,'퇴사자 별도 보관'],['결재대기',`${st.pending_count}건`,'현재 미처리 신청'],['금년 승인 사용',quantity(st.approved_this_year),'올해에 귀속된 사용량'],['직원별 현재 잔여 합계',quantity({minutes:remain}),'각 직원의 현재 연차주기 기준']])+notice('입사기념일이 되면 이전 주기의 미사용 잔여는 <b>이월하지 않고</b> 새 발생량을 적용합니다. 기존 사용·결재 이력은 유지합니다.')+`<section class="card"><h3>직원별 현재 연차</h3>${table(['직원 / 부서','연차기준일','현재 사용기간','발생','사용','대기','잔여','확인'],active.map(u=>`<tr><td><strong>${esc(u.employee_name)}</strong><small>사원번호 ${esc(u.employee_code||'미등록')} · ${esc(u.department)}</small></td><td>${esc(u.leave_basis_date)}</td><td>${esc(u.cycle_start)}<br>~ ${esc(u.cycle_end)}</td><td class="amount">${bal(u,'granted')}</td><td class="amount">${bal(u,'used')}</td><td class="amount">${bal(u,'pending')}</td><td class="amount ${u.remaining<0?'negative':''}">${bal(u,'remaining')}</td><td><button class="btn ghost small" data-ledger="${u.id}">연차대장</button></td></tr>`).join(''))}</section>`;$('#roster-link').onclick=()=>go('employees');$$('[data-ledger]').forEach(b=>b.onclick=()=>ledgerModal(Number(b.dataset.ledger)));return;}
  $('#page').innerHTML=pageHead('나의 연차 현황',`${me.as_of} 기준 · 입사일 기준으로 자동 계산됩니다.`,`<button class="btn" id="apply-link">연차 신청</button>`)+stats([['현재 주기 발생',bal(me,'granted')],['승인 사용',bal(me,'used')],['결재대기',bal(me,'pending')],['현재 잔여',bal(me,'remaining'),'대기 포함 예상 '+bal(me,'projected_remaining')]])+`<section class="card"><h3>사용기간 및 다음 갱신</h3><dl class="detail-grid"><dt>입사일</dt><dd>${esc(me.join_date)}</dd><dt>연차 산정 기준일</dt><dd>${esc(me.leave_basis_date)}</dd><dt>현재 사용기간</dt><dd>${esc(me.cycle_start)} ~ ${esc(me.cycle_end)}</dd><dt>다음 갱신일</dt><dd>${esc(me.next_anniversary||'-')}</dd><dt>다음 기본 발생량</dt><dd>${quantity(me.next_entitlement)}</dd></dl></section>`+notice('자동 발생량은 월 개근·연 출근율 요건 충족을 가정한 기본값입니다. 실제 출근율·촉탁·휴직·소멸 예외는 관리자가 확인합니다.','warning');$('#apply-link').onclick=()=>go('apply');}
 async function apply(id){me=await api('/api/me');const [data,retroPolicy]=await Promise.all([api('/api/approvers'),api('/api/leave-request-policy')]);if(!alive(id))return;data.first=sortPeople(data.first);const selected=[];let calcSequence=0;
  $('#page').innerHTML=pageHead('연차 신청','신청 구분을 선택하고 결재자를 순서대로 지정해 주세요.')+`<section class="card apply-card"><form id="apply-form"><fieldset class="type-field"><legend>신청 구분</legend><div class="leave-type-pills">${[['FULL','하루 / 기간'],['AM_HALF','오전 반차'],['PM_HALF','오후 반차'],['HOURLY','⏱ 시간단위']].map(([v,t],i)=>`<label><input type="radio" name="leave-type" value="${v}" ${i===0?'checked':''}><span>${t}</span></label>`).join('')}</div></fieldset><div class="form-grid" id="dates">${field('시작일','start',nowDate(),'date',`required min="${retroPolicy.earliest_date}"`)}${field('종료일','end',nowDate(),'date',`required min="${retroPolicy.earliest_date}"`)}</div><div class="form-grid hidden" id="datetimes">${field('시작일시','start-dt',nowDate()+'T08:30','datetime-local',`step="1800" min="${retroPolicy.earliest_date}T00:00"`)}${field('종료일시','end-dt',nowDate()+'T09:00','datetime-local',`step="1800" min="${retroPolicy.earliest_date}T00:00"`)}</div><div class="small muted" style="margin:10px 0">시간단위는 30분 간격으로 입력합니다. 점심시간과 휴일은 차감하지 않습니다.</div><div class="calculation" id="calculation">날짜를 선택해 주세요.</div><section class="approval-builder"><h3>결재라인</h3><p class="small muted">마지막에 지정한 결재자가 최종 결정권자입니다. 관리자 지정과 결재자 지정은 별개입니다.</p><div class="inline-add"><select id="approver-picker">${options(data.first.map(x=>[x.id,`${x.employee_name} · ${x.department} · ${x.position}`]),'','결재자 선택')}</select><button type="button" class="btn ghost" id="add-approver">추가</button></div><div id="steps"></div></section><label class="field"><span>신청 사유 / 업무 인수인계</span><textarea id="reason" maxlength="500"></textarea></label><button class="btn wide" type="submit" ${data.first.length?'':'disabled'}>결재 요청</button></form></section>`+notice(`사후 연차 신청 허용: <b>${esc(retroPolicy.earliest_date)}부터</b> (오늘 ${esc(retroPolicy.today)} 기준 2영업일 전, 주말·공휴일·회사휴일 제외). 과거 사용 후 신청은 사유를 작성하고 결재 승인을 받아야 합니다.`)+notice(`현재 잔여 <b>${bal(me,'remaining')}</b> · 대기 포함 예상 <b>${bal(me,'projected_remaining')}</b>. 기존 운영방침대로 잔여가 부족해도 신청할 수 있으며 초과분은 별도로 표시합니다.`,'warning');
@@ -108,11 +160,11 @@ async function backup(id){const [clearPreview,migrationStatus]=await Promise.all
   <div class="cleanup-recovery"><h4>이전 초기화의 서버 안전 백업</h4>${clearPreview.reset_history.length?clearPreview.reset_history.map(r=>`<div class="recovery-item"><span><strong>${esc((r.at||'').slice(0,19).replace('T',' '))}</strong><small>신청 ${Number(r.counts?.requests||0)}건 · 조정 ${Number(r.counts?.adjustments||0)}건 · 확정발생 ${r.cycle_grants_deleted?Number(r.counts?.cycle_grants||0):0}건</small></span><button type="button" class="btn ghost small" data-recovery="${esc(r.backup_key)}">백업받기</button></div>`).join(''):'<p class="muted small">아직 테스트자료 초기화 이력이 없습니다.</p>'}</div>
  </section>
  <section class="card" id="leave-db-migration">
-   <h3>운영 DB 이전 · MES 작업자 연계 (v8.4)</h3>
+   <h3>운영 DB 이전 · MES 작업자 연계 (v8.5)</h3>
    <p>현재 저장소: <strong>${esc(migrationStatus.storage)}</strong> · 직원 ${migrationStatus.counts.users}명 / 신청 ${migrationStatus.counts.requests}건 · 기존 운영자료는 초기화하지 않습니다.</p>
    ${migrationStatus.migrated
      ? `${notice('Supabase PostgreSQL 전환 완료. MES 작업자 자동연계는 실제 MES 테이블 구조를 확인하고 매핑을 활성화한 경우에만 동작합니다.')}
-        <div class="actions"><button class="btn ghost" id="mes-refresh">MES 연계 현황 조회</button><button class="btn ghost" id="mes-retry">미처리 연계 재시도</button></div><div id="mes-status"></div>`
+        <p class="small muted">① MES 작업자 연결 후보를 확인하세요. ② 백업을 보관한 후 관리자가 확정하면 MES 번호로 통일됩니다. 이름·입사일이 불일치하는 직원은 자동 연결하지 않습니다.</p><div class="actions"><button class="btn" id="mes-link-preview">MES 사원번호 연결 후보 확인</button><button class="btn ghost" id="mes-refresh">연계 현황 조회</button><button class="btn ghost" id="mes-retry">미처리 연계 재시도</button></div><div id="mes-status"></div>`
      : `${notice('① 기존 Netlify Blobs JSON 백업 → ② 다운로드 파일 재선택 → ③ 관리자 확인 후 데이터 복제 → ④ Netlify 환경변수 DNM_LEAVE_STORAGE=supabase 적용. ③ 완료 시 기존 Blobs는 읽기 전용으로 동결됩니다.','warning')}
         <div class="actions"><button class="btn" id="migration-download">① 전체 JSON 백업 다운로드</button>
          <label class="btn ghost file-btn">② 백업 JSON 재선택<input id="migration-file" type="file" accept=".json" hidden></label></div>
@@ -148,6 +200,31 @@ async function backup(id){const [clearPreview,migrationStatus]=await Promise.all
      await go('backup');
    });
  } else {
+   $('#mes-link-preview').onclick=e=>task(e.currentTarget,async()=>{
+     const preview=await api('/api/admin/mes-link/preview');
+     const rows=preview.rows||[];
+     const label={ready:'연결 가능',linked:'연결 완료',needs_review_no_mes_match:'MES 미등록/확인 필요',
+       needs_review_multiple:'동명/중복 확인',duplicate_leave_identity:'연차 명부 중복 확인'};
+     const body=notice(`전체 ${rows.length}명 · 새 연결 가능 <b>${preview.ready}명</b> · 이미 연결 <b>${preview.linked}명</b> · 별도 확인 <b>${preview.review}명</b>`)+
+       notice('직원 내부 ID와 비밀번호·연차 신청·결재는 변경하지 않습니다. MES에 동일 이름이 있어도 입사일이 다르면 자동 병합하지 않습니다.')+
+       table(['직원','기존 연차코드','MES 코드','일치 여부'],rows.map(v=>`<tr><td>${esc(v.leave_name)}<small>입사 ${esc(v.leave_hired||'')}</small></td><td>${esc(v.leave_code||'-')}</td><td>${esc(v.mes_code||'-')}</td><td>${badge(label[v.decision]||v.decision,v.decision==='ready'?'green':'')}</td></tr>`).join(''))+
+       `<div class="form-grid" style="margin-top:16px">${field('확인 문구: MES사번연결','mes-link-phrase','','text','autocomplete="off"')}${field('현재 관리자 비밀번호','mes-link-password','','password','autocomplete="current-password"')}</div>`+
+       `<label class="check-row"><input type="checkbox" id="mes-link-backup">현재 연차 JSON과 MES 데이터를 별도 백업했으며, <strong>연결 가능</strong> 직원의 사원번호만 MES 코드로 변경하는 것을 확인했습니다.</label>`+
+       `<label class="check-row"><input type="checkbox" id="mes-link-enable">이후 신규직원 등록 및 퇴사 처리에 MES 작업자 자동 연계 사용 (MES 사용자 계정 발급은 기존 MES에서 확인)</label>`;
+     openModal('MES 사원번호 연결 — 최종 미리보기',body,'<button class="btn" id="mes-link-commit">검증된 직원 연결 적용</button>');
+     $('#mes-link-commit').onclick=btn=>task(btn.currentTarget,async()=>{
+       if(!preview.ready&&!($('#mes-link-enable').checked&&preview.linked))throw new Error('연결 가능한 신규 직원이 없습니다. 기존 연결이 있다면 자동연계 활성화만 진행할 수 있습니다.');
+       if($('#mes-link-phrase').value.trim()!=='MES사번연결')throw new Error('확인 문구 MES사번연결을 정확하게 입력하세요.');
+       if(!$('#mes-link-backup').checked)throw new Error('현재 운영자료 백업 확인이 필요합니다.');
+       const enable=$('#mes-link-enable').checked;
+       if(!confirm(`${preview.ready}명의 사원번호를 MES 코드로 통일합니다. ${preview.review}명은 별도 검토로 남습니다. ${enable?'이후 MES 자동연계도 활성화합니다.':'자동연계는 아직 비활성화합니다.'} 계속하시겠습니까?`))return;
+       const r=await api('/api/admin/mes-link/apply',{method:'POST',body:{
+         expected_revision:preview.revision,confirmation_phrase:'MES사번연결',
+         backup_ack:true,password:$('#mes-link-password').value,enable_sync:enable
+       }});
+       modal.close();toast(`MES 코드 연결 ${r.new_links}건 완료${r.sync_enabled?' · 신규·퇴사 자동연계 활성화':''}`);await shell();await go('backup');
+     });
+   });
    $('#mes-refresh').onclick=e=>task(e.currentTarget,async()=>{
      const r=await api('/api/admin/mes-sync/status');
      const counts={};for(const v of (r.recent_events||[]))counts[v.status]=(counts[v.status]||0)+1;
